@@ -125,12 +125,16 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     discord_msg = ""
 
     if len(trades) == 1:
-        address_line = f"Address: https://hypurrscan.io/address/{trade.address}"
+        address_parts = [f"Address: https://hypurrscan.io/address/{trade.address}"]
         if tag:
-            address_line += f" ({tag})"
+            address_parts.append(f"Tag: {tag}")
+        address_block = "\n".join(address_parts)
 
-        discord_msg = f"""**[{timestamp}] New {trade.trade_type}**
-{address_line}
+        discord_msg = f"""**[{timestamp}] New {trade.trade_type}**"""
+        if trade.trade_type == "FILL":
+            discord_msg += " ポジションに変更があったよ！"
+        discord_msg += f"""
+{address_block}
 ```
 Coin: {trade.coin}
 Price: {trade.price}"""
