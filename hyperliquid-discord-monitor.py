@@ -133,6 +133,7 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         address_parts = [f"Address: https://hypurrscan.io/address/{trade.address}"]
         if tag:
             address_parts.append(f"Tag: {tag}")
+        address_parts.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-USDC&ghost={trade.address}")
         address_block = "\n".join(address_parts)
 
         discord_msg = f"""**[{timestamp}] New {trade.trade_type}**"""
