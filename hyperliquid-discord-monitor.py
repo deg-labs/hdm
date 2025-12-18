@@ -80,6 +80,11 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     """DBパスを指定してトレードを処理"""
     global trade_cache, processed_trades, startup_grace_period, last_notification_time
 
+    # 通知するDirectionを限定
+    allowed_directions = {"Open Long", "Close Long", "Open Short", "Close Short"}
+    if trade.direction not in allowed_directions:
+        return
+
     # ヘルスチェックファイルを更新
     touch_healthcheck_file()
 
