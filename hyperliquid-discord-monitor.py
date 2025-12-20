@@ -150,11 +150,20 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
             else:
                 color = 0xff0000
                 title = f"🔴 Closed Position (Loss)"
+        
+        # Append Tag to Title if it exists
+        if tag:
+            title += f" (Tag: {tag})"
 
         # Reconstruct the original text block format
-        address_parts_text = [f"Address: https://hypurrscan.io/address/{trade.address}"]
-        if tag:
-            address_parts_text.append(f"Tag: {tag}")
+        # Tag is removed from here as it is now in the Title
+        address_parts_text = []
+        
+        # Add "ポジションに変更があったよ！" at the top if trade type is FILL
+        if trade.trade_type == "FILL":
+            address_parts_text.append("ポジションに変更があったよ！")
+
+        address_parts_text.append(f"Address: https://hypurrscan.io/address/{trade.address}")
         address_parts_text.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-USDC&ghost={trade.address}")
         address_block_text = "\n".join(address_parts_text)
 
@@ -162,15 +171,6 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
 Coin: {trade.coin}
 Price: {trade.price}
 Direction: {trade.direction}"""
-        
-        # Add PnL and Size if they were part of the original message and not included in the example.
-        # The user's example didn't explicitly include them in the key-value list.
-        if trade.closed_pnl:
-            pnl_emoji = "🟢" if trade.closed_pnl > 0 else "🔴"
-            original_format_text += f"\nPnL: {pnl_emoji} {trade.closed_pnl:.2f}"
-        
-        original_format_text += f"\nSize: {total_size}"
-
 
         # Create the embed with the original format in the description
         embed = {
