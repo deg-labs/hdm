@@ -58,11 +58,15 @@ def touch_healthcheck_file():
     except Exception as e:
         sys.stderr.write(f"Failed to touch healthcheck file: {e}\n")
 
-def send_to_discord(webhook_url: str, message: str):
+def send_to_discord(webhook_url: str, message: str = None, embed: dict = None):
     payload = {
-        "content": message,
         "username": "Hyperliquid Trade Monitor"
     }
+    if message:
+        payload["content"] = message
+    if embed:
+        payload["embeds"] = [embed]
+        
     headers = {
         "Content-Type": "application/json"
     }
@@ -127,38 +131,62 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     total_size = sum(t.size for t in trades)
     timestamp = trade.timestamp.strftime('%Y-%m-%d %H:%M:%S')
 
-    discord_msg = ""
-
     if len(trades) == 1:
-        address_parts = [f"Address: https://hypurrscan.io/address/{trade.address}"]
-        if tag:
-            address_parts.append(f"Tag: {tag}")
-        address_parts.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-USDC&ghost={trade.address}")
-        address_block = "\n".join(address_parts)
-
-        discord_msg = f"""**[{timestamp}] New {trade.trade_type}**"""
-        if trade.trade_type == "FILL":
-            discord_msg += " ポジションに変更があったよ！"
-        discord_msg += f"""
-{address_block}
-```
-Coin: {trade.coin}
-Price: {trade.price}"""
+        # Determine Color and Title based on trade
+        color = 0x0099ff # Blue default
+        title = f"New {trade.trade_type}"
         
-        if trade.trade_type == "FILL":
-            discord_msg += f"\nDirection: {trade.direction}"
+        if "Long" in trade.direction:
+            color = 0x00ff00 # Green
+            title = f"📈 {trade.direction}"
+        elif "Short" in trade.direction:
+            color = 0xff0000 # Red
+            title = f"📉 {trade.direction}"
         
         if trade.closed_pnl:
-            pnl_emoji = "🟢" if trade.closed_pnl > 0 else "🔴"
-            discord_msg += f"\nPnL: {pnl_emoji} {trade.closed_pnl:.2f}"
-        
-        discord_msg += "\n```"
+            if trade.closed_pnl > 0:
+                color = 0x00ff00
+                title = f"🟢 Closed Position (Profit)"
+            else:
+                color = 0xff0000
+                title = f"🔴 Closed Position (Loss)"
 
-        if discord_msg:
-            print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
-            send_to_discord(webhook_url, discord_msg)
-            # 通知を送信したら、時刻を更新
-            last_notification_time[suppression_key] = current_time
+        # Reconstruct the original text block format
+        address_parts_text = [f"Address: https://hypurrscan.io/address/{trade.address}"]
+        if tag:
+            address_parts_text.append(f"Tag: {tag}")
+        address_parts_text.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-USDC&ghost={trade.address}")
+        address_block_text = "\n".join(address_parts_text)
+
+        original_format_text = f"""{address_block_text}
+Coin: {trade.coin}
+Price: {trade.price}
+Direction: {trade.direction}"""
+        
+        # Add PnL and Size if they were part of the original message and not included in the example.
+        # The user's example didn't explicitly include them in the key-value list.
+        if trade.closed_pnl:
+            pnl_emoji = "🟢" if trade.closed_pnl > 0 else "🔴"
+            original_format_text += f"\nPnL: {pnl_emoji} {trade.closed_pnl:.2f}"
+        
+        original_format_text += f"\nSize: {total_size}"
+
+
+        # Create the embed with the original format in the description
+        embed = {
+            "title": title,
+            "description": original_format_text, # No code block markdown
+            "color": color,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": f"Tx: {trade.tx_hash}"
+            }
+        }
+        
+        print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
+        send_to_discord(webhook_url, embed=embed)
+        # 通知を送信したら、時刻を更新
+        last_notification_time[suppression_key] = current_time
 
 def check_trade_exists_in_db(db_path: str, tx_hash: str) -> bool:
     """DBに指定されたtx_hashのトレードが既に存在するかチェック"""
