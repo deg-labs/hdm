@@ -105,8 +105,8 @@ def fetch_spot_meta_index_map():
         return spot_meta_index_cache
 
     index_map = {}
-    universe = payload.get("universe") if isinstance(payload, dict) else None
-    for item in universe or []:
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    for item in tokens or []:
         if isinstance(item, dict) and "index" in item and "name" in item:
             index_map[item["index"]] = item["name"]
 
@@ -141,14 +141,22 @@ def get_collateral_ticker_for_dex(dex: str) -> str:
     if cached:
         return cached
 
-    collateral_index = fetch_collateral_token_index(dex)
-    if collateral_index is None:
+    collateral_token = fetch_collateral_token_index(dex)
+    if collateral_token is None:
         ticker = "USDC"
-    elif collateral_index == 0:
-        ticker = "USDC"
-    else:
-        index_map = fetch_spot_meta_index_map()
-        ticker = index_map.get(collateral_index, "USDC")
+    elif isinstance(collateral_token, str):
+        if collateral_token.isdigit():
+            collateral_token = int(collateral_token)
+        else:
+            ticker = collateral_token
+    elif isinstance(collateral_token, float) and collateral_token.is_integer():
+        collateral_token = int(collateral_token)
+    if "ticker" not in locals():
+        if collateral_token == 0:
+            ticker = "USDC"
+        else:
+            index_map = fetch_spot_meta_index_map()
+            ticker = index_map.get(collateral_token, "USDC")
 
     collateral_ticker_cache[dex] = ticker
     return ticker
