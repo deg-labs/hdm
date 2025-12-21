@@ -10,11 +10,13 @@ import threading
 from websocket._exceptions import WebSocketConnectionClosedException
 from hyperliquid_monitor.monitor import HyperliquidMonitor
 from hyperliquid_monitor.types import Trade
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 import requests
 import json
 from dotenv import load_dotenv
+from types import SimpleNamespace
+from hyperliquid.info import Info
 
 load_dotenv()
 
@@ -161,6 +163,61 @@ def get_collateral_ticker_for_dex(dex: str) -> str:
     collateral_ticker_cache[dex] = ticker
     return ticker
 
+def build_trade_embed(trade: Trade, tag: str):
+    direction = trade.direction or ""
+    # Determine Color and Title based on trade
+    color = 0x0099ff # Blue default
+    title = f"New {trade.trade_type}"
+    
+    if "Long" in direction:
+        color = 0x00ff00 # Green
+        title = f"📈 {direction}"
+    elif "Short" in direction:
+        color = 0xff0000 # Red
+        title = f"📉 {direction}"
+    
+    if trade.closed_pnl:
+        if trade.closed_pnl > 0:
+            color = 0x00ff00
+            title = f"🟢 Closed Position (Profit)"
+        else:
+            color = 0xff0000
+            title = f"🔴 Closed Position (Loss)"
+    
+    # Append Tag to Title if it exists
+    if tag:
+        title += f" (Tag: {tag})"
+
+    # Reconstruct the original text block format
+    # Tag is removed from here as it is now in the Title
+    address_parts_text = []
+    
+    # Add "ポジションに変更があったよ！" at the top if trade type is FILL
+    if trade.trade_type == "FILL":
+        address_parts_text.append("ポジションに変更があったよ！")
+
+    dex = trade.coin.split(":", 1)[0] if trade.coin and ":" in trade.coin else ""
+    collateral_ticker = get_collateral_ticker_for_dex(dex)
+    address_parts_text.append(f"Address: https://hypurrscan.io/address/{trade.address}")
+    address_parts_text.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-{collateral_ticker}&ghost={trade.address}")
+    address_block_text = "\n".join(address_parts_text)
+
+    display_direction = trade.direction or "Unknown"
+    original_format_text = f"""{address_block_text}
+Coin: {trade.coin}
+Price: {trade.price}
+Direction: {display_direction}"""
+
+    return {
+        "title": title,
+        "description": original_format_text, # No code block markdown
+        "color": color,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {
+            "text": f"Tx: {trade.tx_hash}"
+        }
+    }
+
 def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str):
     """DBパスを指定してトレードを処理"""
     global trade_cache, processed_trades, startup_grace_period, last_notification_time
@@ -213,58 +270,7 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     timestamp = trade.timestamp.strftime('%Y-%m-%d %H:%M:%S')
 
     if len(trades) == 1:
-        # Determine Color and Title based on trade
-        color = 0x0099ff # Blue default
-        title = f"New {trade.trade_type}"
-        
-        if "Long" in trade.direction:
-            color = 0x00ff00 # Green
-            title = f"📈 {trade.direction}"
-        elif "Short" in trade.direction:
-            color = 0xff0000 # Red
-            title = f"📉 {trade.direction}"
-        
-        if trade.closed_pnl:
-            if trade.closed_pnl > 0:
-                color = 0x00ff00
-                title = f"🟢 Closed Position (Profit)"
-            else:
-                color = 0xff0000
-                title = f"🔴 Closed Position (Loss)"
-        
-        # Append Tag to Title if it exists
-        if tag:
-            title += f" (Tag: {tag})"
-
-        # Reconstruct the original text block format
-        # Tag is removed from here as it is now in the Title
-        address_parts_text = []
-        
-        # Add "ポジションに変更があったよ！" at the top if trade type is FILL
-        if trade.trade_type == "FILL":
-            address_parts_text.append("ポジションに変更があったよ！")
-
-        dex = trade.coin.split(":", 1)[0] if trade.coin else ""
-        collateral_ticker = get_collateral_ticker_for_dex(dex)
-        address_parts_text.append(f"Address: https://hypurrscan.io/address/{trade.address}")
-        address_parts_text.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-{collateral_ticker}&ghost={trade.address}")
-        address_block_text = "\n".join(address_parts_text)
-
-        original_format_text = f"""{address_block_text}
-Coin: {trade.coin}
-Price: {trade.price}
-Direction: {trade.direction}"""
-
-        # Create the embed with the original format in the description
-        embed = {
-            "title": title,
-            "description": original_format_text, # No code block markdown
-            "color": color,
-            "timestamp": datetime.utcnow().isoformat(),
-            "footer": {
-                "text": f"Tx: {trade.tx_hash}"
-            }
-        }
+        embed = build_trade_embed(trade, tag)
         
         print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
         send_to_discord(webhook_url, embed=embed)
@@ -313,6 +319,157 @@ def check_trade_exists_in_db(db_path: str, tx_hash: str) -> bool:
     except Exception as e:
         print(f"Error checking trade in DB: {e}")
         return False
+
+def parse_trade_timestamp(value):
+    if value is None:
+        return datetime.utcnow()
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            try:
+                return datetime.fromtimestamp(float(value))
+            except ValueError:
+                return datetime.utcnow()
+    return datetime.utcnow()
+
+def load_latest_trade_from_db(db_path: str):
+    import sqlite3
+    try:
+        if not os.path.exists(db_path):
+            return None
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='trades'
+        """)
+        if not cursor.fetchone():
+            conn.close()
+            return None
+        cursor.execute("PRAGMA table_info(trades)")
+        columns = [column[1] for column in cursor.fetchall()]
+        if not columns:
+            conn.close()
+            return None
+        order_by = "timestamp DESC" if "timestamp" in columns else "rowid DESC"
+        cursor.execute(f"SELECT * FROM trades ORDER BY {order_by} LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        data = dict(zip(columns, row))
+        timestamp = parse_trade_timestamp(data.get("timestamp"))
+        trade = SimpleNamespace(
+            timestamp=timestamp,
+            address=data.get("address"),
+            coin=data.get("coin"),
+            side=data.get("side") or "BUY",
+            size=float(data.get("size") or 0),
+            price=float(data.get("price") or 0),
+            trade_type=data.get("trade_type") or "FILL",
+            direction=data.get("direction") or "",
+            tx_hash=data.get("tx_hash"),
+            closed_pnl=float(data.get("closed_pnl")) if data.get("closed_pnl") is not None else None,
+        )
+        if not trade.address or not trade.coin:
+            return None
+        return trade
+    except Exception as e:
+        print(f"Error loading latest trade from DB {db_path}: {e}")
+        return None
+
+def run_test_preview(addresses_file: str):
+    if not os.path.exists(addresses_file):
+        print(f"Addresses file not found: {addresses_file}")
+        return
+
+    addresses = load_addresses(addresses_file)
+    timeout_seconds = int(os.getenv("TEST_PREVIEW_TIMEOUT_SECONDS", 60))
+    max_entries = int(os.getenv("TEST_PREVIEW_MAX_ENTRIES", 10))
+    count = 0
+    seen_hashes = set()
+    pending = set(addresses.keys())
+    printed_per_address = defaultdict(int)
+    count_lock = threading.Lock()
+    done_event = threading.Event()
+
+    print(f"Starting websocket preview for {len(addresses)} addresses (timeout: {timeout_seconds}s)")
+    print(f"Printing up to {max_entries} fills")
+
+    def build_trade_from_fill(fill, address):
+        timestamp = datetime.fromtimestamp(int(fill.get("time", 0)) / 1000)
+        return Trade(
+            timestamp=timestamp,
+            address=address,
+            coin=fill.get("coin", "Unknown"),
+            side="BUY" if fill.get("side", "B") == "A" else "SELL",
+            size=float(fill.get("sz", 0)),
+            price=float(fill.get("px", 0)),
+            trade_type="FILL",
+            direction=fill.get("dir"),
+            tx_hash=fill.get("hash"),
+            fee=float(fill.get("fee", 0)),
+            fee_token=fill.get("feeToken"),
+            start_position=float(fill.get("startPosition", 0)),
+            closed_pnl=float(fill.get("closedPnl", 0))
+        )
+
+    def callback(msg):
+        nonlocal count
+        if not isinstance(msg, dict):
+            return
+        data = msg.get("data") or {}
+        fills = data.get("fills") or []
+        address = (data.get("user") or "").lower()
+        if address not in addresses:
+            return
+        for fill in fills:
+            tx_hash = fill.get("hash")
+            if not tx_hash:
+                continue
+            with count_lock:
+                if tx_hash in seen_hashes:
+                    continue
+                if count >= max_entries:
+                    done_event.set()
+                    return
+                if pending and address not in pending:
+                    continue
+                seen_hashes.add(tx_hash)
+                count += 1
+                printed_per_address[address] += 1
+                if printed_per_address[address] >= 1 and address in pending:
+                    pending.remove(address)
+            trade = build_trade_from_fill(fill, address)
+            tag = addresses.get(trade.address)
+            embed = build_trade_embed(trade, tag)
+            print("\n-----")
+            print(f"Address: {trade.address}")
+            print(f"Title: {embed['title']}")
+            print(embed["description"])
+            print(embed["footer"]["text"])
+            if count >= max_entries or not pending:
+                done_event.set()
+                return
+
+    info = Info()
+    for address in addresses.keys():
+        info.subscribe({"type": "userFills", "user": address}, callback)
+
+    done_event.wait(timeout_seconds)
+    if hasattr(info, "ws_manager") and info.ws_manager:
+        try:
+            info.ws_manager.ws.close()
+        except Exception as e:
+            print(f"Error closing websocket: {e}")
+
+    with count_lock:
+        printed = count
+    if printed < max_entries:
+        print(f"\nTimeout reached. Printed {printed}/{max_entries} fills.")
 
 def load_addresses(file_path: str) -> dict:
     addresses = {}
@@ -647,6 +804,10 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    if args.addresses_file == "tests":
+        run_test_preview("addresses.txt")
+        sys.exit(0)
 
     webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
     if not webhook_url:
