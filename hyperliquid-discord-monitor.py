@@ -35,6 +35,11 @@ trade_cache = defaultdict(list)
 monitor_instances = {}
 main_loop = None
 monitor_tasks = {}
+collateral_ticker_cache = {}
+spot_meta_index_cache = None
+
+HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+HYPERLIQUID_REQUEST_TIMEOUT = 10
 
 processed_trades = set()
 startup_grace_period = {}
@@ -79,6 +84,73 @@ def send_to_discord(webhook_url: str, message: str = None, embed: dict = None):
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         sys.stderr.write(f"Failed to send message to Discord: {e}\n")
+
+def fetch_spot_meta_index_map():
+    global spot_meta_index_cache
+    if spot_meta_index_cache is not None:
+        return spot_meta_index_cache
+
+    try:
+        response = requests.post(
+            HYPERLIQUID_INFO_URL,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps({"type": "spotMeta"}),
+            timeout=HYPERLIQUID_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.RequestException as e:
+        sys.stderr.write(f"Failed to fetch spotMeta: {e}\n")
+        spot_meta_index_cache = {}
+        return spot_meta_index_cache
+
+    index_map = {}
+    for item in payload or []:
+        if isinstance(item, dict) and "index" in item and "name" in item:
+            index_map[item["index"]] = item["name"]
+
+    spot_meta_index_cache = index_map
+    return spot_meta_index_cache
+
+def fetch_collateral_token_index(dex: str):
+    try:
+        response = requests.post(
+            HYPERLIQUID_INFO_URL,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps({"type": "metaAndAssetCtxs", "dex": dex}),
+            timeout=HYPERLIQUID_REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.exceptions.RequestException as e:
+        sys.stderr.write(f"Failed to fetch metaAndAssetCtxs for dex {dex}: {e}\n")
+        return None
+
+    if not payload or not isinstance(payload, list):
+        return None
+    meta = payload[0] if payload else None
+    if not isinstance(meta, dict):
+        return None
+    return meta.get("collateralToken")
+
+def get_collateral_ticker_for_dex(dex: str) -> str:
+    if not dex:
+        return "USDC"
+    cached = collateral_ticker_cache.get(dex)
+    if cached:
+        return cached
+
+    collateral_index = fetch_collateral_token_index(dex)
+    if collateral_index is None:
+        ticker = "USDC"
+    elif collateral_index == 0:
+        ticker = "USDC"
+    else:
+        index_map = fetch_spot_meta_index_map()
+        ticker = index_map.get(collateral_index, "USDC")
+
+    collateral_ticker_cache[dex] = ticker
+    return ticker
 
 def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str):
     """DBパスを指定してトレードを処理"""
@@ -163,8 +235,10 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         if trade.trade_type == "FILL":
             address_parts_text.append("ポジションに変更があったよ！")
 
+        dex = trade.coin.split(":", 1)[0] if trade.coin else ""
+        collateral_ticker = get_collateral_ticker_for_dex(dex)
         address_parts_text.append(f"Address: https://hypurrscan.io/address/{trade.address}")
-        address_parts_text.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-USDC&ghost={trade.address}")
+        address_parts_text.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-{collateral_ticker}&ghost={trade.address}")
         address_block_text = "\n".join(address_parts_text)
 
         original_format_text = f"""{address_block_text}
