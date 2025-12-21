@@ -105,7 +105,8 @@ def fetch_spot_meta_index_map():
         return spot_meta_index_cache
 
     index_map = {}
-    for item in payload or []:
+    universe = payload.get("universe") if isinstance(payload, dict) else None
+    for item in universe or []:
         if isinstance(item, dict) and "index" in item and "name" in item:
             index_map[item["index"]] = item["name"]
 
