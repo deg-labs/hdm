@@ -37,15 +37,17 @@ jobs:
           # Add other variables here as needed
           envsubst < .env.template > .env
 
-      # 3. Upload .env to GCE (to the generated user's home dir first)
-      # We omit the username so gcloud uses the authenticated SA identity (OS Login)
-      - name: Upload .env to GCE
+      # 3. Create artifact and Upload to GCE
+      - name: Create and Upload Artifacts
         run: |
-          gcloud compute scp .env ${{ secrets.GCE_INSTANCE_NAME }}:~/.env \
+          # Create tarball excluding .git
+          tar -czf app.tar.gz --exclude=.git .
+          
+          # Upload .env and app.tar.gz to GCE home directory
+          gcloud compute scp .env app.tar.gz ${{ secrets.GCE_INSTANCE_NAME }}:~ \
             --zone ${{ secrets.GCE_ZONE }}
 
       # 4. SSH to Deploy
-      # Move .env to target dir and update containers
       - name: Deploy on GCE
         run: |
           gcloud compute ssh ${{ secrets.GCE_INSTANCE_NAME }} \
@@ -54,41 +56,22 @@ jobs:
               set -e
               TARGET_DIR='/opt/apps/hdm'
 
-              # Ensure target directory exists
-              if [ ! -d "$TARGET_DIR" ]; then
-                echo "Creating target directory: $TARGET_DIR"
-                sudo mkdir -p "$TARGET_DIR"
-                sudo chown $(id -u):$(id -g) "$TARGET_DIR"
-              fi
+              # 1) Ensure target directory exists and is owned by current user
+              sudo mkdir -p \"\$TARGET_DIR\"
+              sudo chown -R \$(id -u):\$(id -g) \"\$TARGET_DIR\"
 
-              # Move .env from home to app dir
-              # Use -f to force overwrite
-              if [ -f ~/.env ]; then
-                sudo mv -f ~/.env "$TARGET_DIR/.env"
-                sudo chown $(id -u):$(id -g) "$TARGET_DIR/.env"
-              else
-                 echo "Warning: ~/.env not found. Skipping move."
-              fi
+              # 2) Extract source code
+              # -o overwrites without complaining, -C changes dir before extracting
+              tar -xzf ~/app.tar.gz -C \"\$TARGET_DIR\"
+              rm ~/app.tar.gz
 
-              cd "$TARGET_DIR"
+              # 3) Move .env to target directory
+              mv -f ~/.env \"\$TARGET_DIR/.env\"
               
-              # Clone if not initialized
-              if [ ! -d ".git" ]; then
-                echo "Cloning repository..."
-                # Attempt to clone using HTTPS
-                git clone https://github.com/deg-labs/hdm.git .
-              fi
-
-              # Ensure git considers this directory safe
-              git config --global --add safe.directory "$TARGET_DIR"
-              
-              echo "Updating codebase..."
-              git fetch --all
-              git reset --hard origin/main
-              
-              # Update dependencies
-              echo "Starting Docker Compose..."
-              docker compose pull || true
+              # 4) Restart services
+              cd \"\$TARGET_DIR\"
+              echo \"Starting Docker Compose...\"
+              docker compose down
               docker compose up -d --build
               docker image prune -f || true
             "
