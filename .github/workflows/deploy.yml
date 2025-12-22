@@ -40,11 +40,16 @@ jobs:
       # 3. Create artifact and Upload to GCE
       - name: Create and Upload Artifacts
         run: |
-          # Create tarball excluding .git
-          tar -czf app.tar.gz --exclude=.git .
+          # Pack source to /tmp to avoid "file changed as we read it" error
+          # Exclude .git, .env (managed separately), and data (persistent on VM)
+          tar -C "$GITHUB_WORKSPACE" -czf /tmp/app.tar.gz \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=data \
+            .
           
           # Upload .env and app.tar.gz to GCE home directory
-          gcloud compute scp .env app.tar.gz ${{ secrets.GCE_INSTANCE_NAME }}:~ \
+          gcloud compute scp .env /tmp/app.tar.gz ${{ secrets.GCE_INSTANCE_NAME }}:~ \
             --zone ${{ secrets.GCE_ZONE }}
 
       # 4. SSH to Deploy
