@@ -204,3 +204,28 @@ sudo supervisorctl reread
 sudo supervisorctl update
 sudo supervisorctl start hyperliquid-discord-monitor
 ```
+
+---
+
+## GitHub Actions Deployment to GCE
+
+This project includes a GitHub Actions workflow (`.github/workflows/deploy.yml`) to automate deployment to a Google Compute Engine (GCE) instance using Workload Identity Federation. To use this, you need to configure the following GitHub Secrets and Variables in your repository settings (`Settings > Secrets and variables > Actions`).
+
+### GitHub Secrets (Repository Secrets)
+
+These are sensitive credentials that should be stored securely as GitHub Secrets:
+
+*   **`GCP_WIF_PROVIDER`**: The Workload Identity Federation provider resource name for your Google Cloud project (e.g., `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL_ID>/providers/<PROVIDER_ID>`).
+*   **`GCP_SA_EMAIL`**: The email address of the Google Cloud Service Account that GitHub Actions will use for authentication (e.g., `github-actions@<PROJECT_ID>.iam.gserviceaccount.com`). This Service Account needs appropriate permissions, including `Service Account User` role and permissions for `Compute Instance Admin (v1)` or specific `compute.instances.ssh` and `compute.instances.get` roles, along with permissions to write to the target directory on the GCE instance (if not using `sudo`).
+*   **`GCE_INSTANCE_NAME`**: The name of your GCE instance where the application will be deployed.
+*   **`GCE_ZONE`**: The Google Cloud zone where your GCE instance is located (e.g., `asia-northeast1-b`).
+*   **`DISCORD_WEBHOOK_URL`**: Your Discord Webhook URL for sending notifications.
+
+### GitHub Variables (Repository Variables)
+
+This is for non-sensitive configuration that can be easily changed:
+
+*   **`NOTIFICATION_SUPPRESSION_SECONDS`**: (Optional) Cooldown time in seconds between notifications for the same type of trade. Defaults to `600` if not set.
+
+**Note:** The deployment workflow assumes the application will be deployed to `/opt/apps/hdm` on the GCE instance. Ensure this directory exists and the service account has the necessary permissions to write to it (or relies on `sudo` as configured in the workflow).
+
