@@ -45,26 +45,49 @@ jobs:
             --zone ${{ secrets.GCE_ZONE }}
 
       # 4. SSH to Deploy
-      # Move .env from home to app dir (requires sudo)
+      # Move .env to target dir and update containers
       - name: Deploy on GCE
         run: |
           gcloud compute ssh ${{ secrets.GCE_INSTANCE_NAME }} \
             --zone ${{ secrets.GCE_ZONE }} \
             --command "
               set -e
-              # Move .env from home to app dir (requires sudo)
-              sudo mv ~/.env /opt/apps/hdm/.env
-              sudo chown $(id -u):$(id -g) /opt/apps/hdm/.env
+              TARGET_DIR='/opt/apps/hdm'
 
-              cd /opt/apps/hdm
+              # Ensure target directory exists
+              if [ ! -d "$TARGET_DIR" ]; then
+                echo "Creating target directory: $TARGET_DIR"
+                sudo mkdir -p "$TARGET_DIR"
+                sudo chown $(id -u):$(id -g) "$TARGET_DIR"
+              fi
+
+              # Move .env from home to app dir
+              # Use -f to force overwrite
+              if [ -f ~/.env ]; then
+                sudo mv -f ~/.env "$TARGET_DIR/.env"
+                sudo chown $(id -u):$(id -g) "$TARGET_DIR/.env"
+              else
+                 echo "Warning: ~/.env not found. Skipping move."
+              fi
+
+              cd "$TARGET_DIR"
               
-              # Ensure git considers this directory safe (in case owner differs)
-              git config --global --add safe.directory /opt/apps/hdm
+              # Clone if not initialized
+              if [ ! -d ".git" ]; then
+                echo "Cloning repository..."
+                # Attempt to clone using HTTPS
+                git clone https://github.com/deg-labs/hdm.git .
+              fi
+
+              # Ensure git considers this directory safe
+              git config --global --add safe.directory "$TARGET_DIR"
               
+              echo "Updating codebase..."
               git fetch --all
               git reset --hard origin/main
               
               # Update dependencies
+              echo "Starting Docker Compose..."
               docker compose pull || true
               docker compose up -d --build
               docker image prune -f || true
