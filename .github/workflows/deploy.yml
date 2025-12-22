@@ -76,7 +76,7 @@ jobs:
               # 4) Restart services
               cd \"\$TARGET_DIR\"
               echo \"Starting Docker Compose...\"
-              docker compose down
-              docker compose up -d --build
-              docker image prune -f || true
+              sudo docker compose down
+              sudo docker compose up -d --build
+              sudo docker image prune -f || true
             "
