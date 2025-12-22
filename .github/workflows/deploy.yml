@@ -2,7 +2,9 @@ name: deploy-to-gce
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - "main"
+      - "feat/*"
 
 jobs:
   deploy:
