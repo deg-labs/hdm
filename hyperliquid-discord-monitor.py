@@ -218,7 +218,7 @@ Direction: {display_direction}"""
         }
     }
 
-def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str):
+def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str, specific_webhook_url: str = None):
     """DBパスを指定してトレードを処理"""
     global trade_cache, processed_trades, startup_grace_period, last_notification_time
 
@@ -274,6 +274,11 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         
         print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
         send_to_discord(webhook_url, embed=embed)
+        
+        if specific_webhook_url:
+            print(f"[{address_suffix}] Sending Discord notification to specific webhook: {trade.tx_hash}")
+            send_to_discord(specific_webhook_url, embed=embed)
+
         # 通知を送信したら、時刻を更新
         last_notification_time[suppression_key] = current_time
 
@@ -444,7 +449,8 @@ def run_test_preview(addresses_file: str):
                 if printed_per_address[address] >= 1 and address in pending:
                     pending.remove(address)
             trade = build_trade_from_fill(fill, address)
-            tag = addresses.get(trade.address)
+            info = addresses.get(trade.address)
+            tag = info.get('tag') if info else None
             embed = build_trade_embed(trade, tag)
             print("\n-----")
             print(f"Address: {trade.address}")
@@ -480,12 +486,13 @@ def load_addresses(file_path: str) -> dict:
                 if not line:
                     continue
                 
-                parts = line.split(',', 1)
-                address = parts[0].strip().lower()
+                parts = [p.strip() for p in line.split(',')]
+                address = parts[0].lower()
                 
                 if address:
-                    tag = parts[1].strip() if len(parts) > 1 else None
-                    addresses[address] = tag
+                    tag = parts[1] if len(parts) > 1 and parts[1] else None
+                    webhook = parts[2] if len(parts) > 2 and parts[2] else None
+                    addresses[address] = {'tag': tag, 'webhook': webhook}
     except IOError as e:
         sys.stderr.write(f"Error reading addresses file: {e}\n")
         sys.exit(1)
@@ -512,9 +519,12 @@ def remove_pidfile(pidfile):
     except OSError as e:
         print(f"Error removing pidfile: {e}")
 
-async def monitor_address_async(webhook_url: str, address: str, tag: str, address_index: int):
+async def monitor_address_async(webhook_url: str, address: str, info: dict, address_index: int):
     """非同期で単一アドレスを監視し、切断時に自動再接続する"""
     global startup_grace_period, monitor_instances
+
+    tag = info.get('tag')
+    specific_webhook_url = info.get('webhook')
     
     db_path = os.path.join(DB_DIRECTORY, f"trades_{address[-8:]}.db")
 
@@ -524,15 +534,15 @@ async def monitor_address_async(webhook_url: str, address: str, tag: str, addres
         'connection_dead': threading.Event()
     }
 
-    def create_callback(addr, db_file, tag_param):
+    def create_callback(addr, db_file, tag_param, specific_webhook_param):
         def callback(trade):
             # Update the timestamp on each new trade
             shared_state['last_trade_time'] = time.time()
-            return process_trade_with_db(webhook_url, trade, db_file, tag_param)
+            return process_trade_with_db(webhook_url, trade, db_file, tag_param, specific_webhook_param)
         return callback
 
     # Create the callback once
-    monitor_callback = create_callback(address, db_path, tag)
+    monitor_callback = create_callback(address, db_path, tag, specific_webhook_url)
 
     while True:  # The main reconnection loop
         monitor = None
@@ -652,12 +662,13 @@ async def run_multi_monitor_async(webhook_url: str, addresses: dict):
     
     # 各アドレスの監視タスクを作成
     tasks = []
-    for i, (address, tag) in enumerate(addresses.items()):
+    for i, (address, info) in enumerate(addresses.items()):
         task = asyncio.create_task(
-            monitor_address_async(webhook_url, address, tag, i)
+            monitor_address_async(webhook_url, address, info, i)
         )
         tasks.append(task)
         monitor_tasks[address] = task
+        tag = info.get('tag')
         print(f"Created monitoring task for address {i}: {address}" + (f" ({tag})" if tag else ""))
     
     try:
@@ -744,7 +755,8 @@ def run_monitor(webhook_url: str, addresses_file: str, background_mode: bool = F
     addresses = load_addresses(addresses_file)
     
     print(f"Loading {len(addresses)} addresses:")
-    for i, (addr, tag) in enumerate(addresses.items()):
+    for i, (addr, info) in enumerate(addresses.items()):
+        tag = info.get('tag')
         print(f"  {i+1}: {addr}" + (f" (Tag: {tag})" if tag else ""))
     
     # シグナルハンドラーの設定
