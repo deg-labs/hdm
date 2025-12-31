@@ -198,15 +198,17 @@ def build_trade_embed(trade: Trade, tag: str):
 
     dex = trade.coin.split(":", 1)[0] if trade.coin and ":" in trade.coin else ""
     collateral_ticker = get_collateral_ticker_for_dex(dex)
-    address_parts_text.append(f"Address: https://hypurrscan.io/address/{trade.address}")
-    address_parts_text.append(f"Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-{collateral_ticker}&ghost={trade.address}")
+
     address_block_text = "\n".join(address_parts_text)
 
     display_direction = trade.direction or "Unknown"
     original_format_text = f"""{address_block_text}
 Coin: {trade.coin}
 Price: {trade.price}
-Direction: {display_direction}"""
+Direction: {display_direction}
+
+Address: https://hypurrscan.io/address/{trade.address}
+Trade.xyz: https://app.trade.xyz/trade?market={trade.coin}-{collateral_ticker}&ghost={trade.address}"""
 
     return {
         "title": title,
@@ -386,7 +388,7 @@ def load_latest_trade_from_db(db_path: str):
         print(f"Error loading latest trade from DB {db_path}: {e}")
         return None
 
-def run_test_preview(addresses_file: str):
+def run_test_preview(addresses_file: str, enable_posting: bool = False):
     if not os.path.exists(addresses_file):
         print(f"Addresses file not found: {addresses_file}")
         return
@@ -402,6 +404,8 @@ def run_test_preview(addresses_file: str):
     done_event = threading.Event()
 
     print(f"Starting websocket preview for {len(addresses)} addresses (timeout: {timeout_seconds}s)")
+    if enable_posting:
+        print("WARNING: Discord posting is ENABLED for this test.")
     print(f"Printing up to {max_entries} fills")
 
     def build_trade_from_fill(fill, address):
@@ -451,12 +455,22 @@ def run_test_preview(addresses_file: str):
             trade = build_trade_from_fill(fill, address)
             info = addresses.get(trade.address)
             tag = info.get('tag') if info else None
+            specific_webhook = info.get('webhook') if info else None
             embed = build_trade_embed(trade, tag)
             print("\n-----")
-            print(f"Address: {trade.address}")
             print(f"Title: {embed['title']}")
             print(embed["description"])
             print(embed["footer"]["text"])
+
+            if enable_posting:
+                webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+                if webhook_url:
+                    print("Sending to global webhook...")
+                    send_to_discord(webhook_url, embed=embed)
+                if specific_webhook:
+                    print("Sending to specific webhook...")
+                    send_to_discord(specific_webhook, embed=embed)
+
             if count >= max_entries or not pending:
                 done_event.set()
                 return
@@ -796,9 +810,9 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
-        "addresses_file",
-        nargs="?",
-        help="Path to the file containing addresses to monitor"
+        "command_or_file",
+        nargs="+",
+        help="Path to addresses file, OR 'tests' to run preview, OR 'tests post' to preview and post to Discord"
     )
     parser.add_argument(
         "-d", "--daemon",
@@ -817,29 +831,32 @@ def main():
 
     args = parser.parse_args()
 
-    if args.addresses_file == "tests":
-        run_test_preview("addresses.txt")
+    # Handle "tests" command
+    if args.command_or_file[0] == "tests":
+        enable_posting = len(args.command_or_file) > 1 and args.command_or_file[1] == "post"
+        run_test_preview("addresses.txt", enable_posting=enable_posting)
         sys.exit(0)
 
+    addresses_file = args.command_or_file[0]
     webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
     if not webhook_url:
         sys.stderr.write("Error: DISCORD_WEBHOOK_URL not found in environment variables.\n")
         sys.stderr.write("Please create a .env file with DISCORD_WEBHOOK_URL=your_webhook_url\n")
         sys.exit(1)
 
-    if not os.path.exists(args.addresses_file):
-        sys.stderr.write(f"Addresses file not found: {args.addresses_file}\n")
+    if not os.path.exists(addresses_file):
+        sys.stderr.write(f"Addresses file not found: {addresses_file}\n")
         sys.exit(1)
 
     if args.daemon and not args.background:
         script_path = os.path.abspath(sys.argv[0])
-        addresses = load_addresses(args.addresses_file)
+        addresses = load_addresses(addresses_file)
         
         print(f"Starting daemon for {len(addresses)} addresses in single process")
-        start_daemon(script_path, args.addresses_file)
+        start_daemon(script_path, addresses_file)
         sys.exit(0)
 
-    run_monitor(webhook_url, args.addresses_file, args.background)
+    run_monitor(webhook_url, addresses_file, args.background)
 
 if __name__ == "__main__":
     main()
