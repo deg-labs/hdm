@@ -1,0 +1,82 @@
+name: deploy-to-gce
+
+on:
+  push:
+    branches:
+      - "main"
+      - "feat/*"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Google Cloud Auth (Workload Identity Federation)
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # 2. Generate .env from secrets
+      - name: Generate .env
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext-base
+          export DISCORD_WEBHOOK_URL="${{ secrets.DISCORD_WEBHOOK_URL }}"
+          export NOTIFICATION_SUPPRESSION_SECONDS="${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || 600 }}"
+          export DB_DIRECTORY="./data"
+          # Add other variables here as needed
+          envsubst < .env.template > .env
+
+      # 3. Create artifact and Upload to GCE
+      - name: Create and Upload Artifacts
+        run: |
+          # Pack source to /tmp to avoid "file changed as we read it" error
+          # Exclude .git, .env (managed separately), and data (persistent on VM)
+          tar -C "$GITHUB_WORKSPACE" -czf /tmp/app.tar.gz \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=data \
+            .
+          
+          # Upload .env and app.tar.gz to GCE home directory
+          gcloud compute scp .env /tmp/app.tar.gz ${{ secrets.GCE_INSTANCE_NAME }}:~ \
+            --zone ${{ secrets.GCE_ZONE }}
+
+      # 4. SSH to Deploy
+      - name: Deploy on GCE
+        run: |
+          gcloud compute ssh ${{ secrets.GCE_INSTANCE_NAME }} \
+            --zone ${{ secrets.GCE_ZONE }} \
+            --command "
+              set -e
+              TARGET_DIR='/opt/apps/hdm'
+
+              # 1) Ensure target directory exists and is owned by current user
+              sudo mkdir -p \"\$TARGET_DIR\"
+              sudo chown -R \$(id -u):\$(id -g) \"\$TARGET_DIR\"
+
+              # 2) Extract source code
+              # -o overwrites without complaining, -C changes dir before extracting
+              tar -xzf ~/app.tar.gz -C \"\$TARGET_DIR\"
+              rm ~/app.tar.gz
+
+              # 3) Move .env to target directory
+              mv -f ~/.env \"\$TARGET_DIR/.env\"
+              
+              # 4) Restart services
+              cd \"\$TARGET_DIR\"
+              echo \"Starting Docker Compose...\"
+              sudo docker compose down
+              sudo docker compose up -d --build
+              sudo docker image prune -f || true
+            "
