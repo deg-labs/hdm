@@ -210,6 +210,9 @@ sudo supervisorctl start hyperliquid-discord-monitor
 ## GitHub Actions で GCE へデプロイ
 
 このプロジェクトには GitHub Actions ワークフロー（`.github/workflows/deploy.yml`）が含まれており、Workload Identity Federation を使って Google Compute Engine (GCE) へ自動デプロイします。利用には GitHub Secrets と Variables の設定が必要です（`Settings > Secrets and variables > Actions`）。
+  
+参考として以下のPRのようにPR作成しラベル付与でデプロイをトリガーできます:
+https://github.com/deg-labs/hdm/pull/3  
 
 ### GitHub Secrets（Repository Secrets）
 
