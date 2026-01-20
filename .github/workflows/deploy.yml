@@ -28,16 +28,22 @@ jobs:
               echo "GCE_INSTANCE_NAME=${{ secrets.DEV_GCE_INSTANCE_NAME }}" >> "$GITHUB_ENV"
               echo "GCP_SA_EMAIL=${{ secrets.DEV_GCP_SA_EMAIL }}" >> "$GITHUB_ENV"
               echo "GCP_WIF_PROVIDER=${{ secrets.DEV_GCP_WIF_PROVIDER }}" >> "$GITHUB_ENV"
+              echo "DISCORD_WEBHOOK_URL=${{ secrets.DEV_DISCORD_WEBHOOK_URL }}" >> "$GITHUB_ENV"
+              echo "ADDRESSES_TXT=${{ secrets.DEV_ADDRESSES_TXT }}" >> "$GITHUB_ENV"
               ;;
             stg)
               echo "GCE_INSTANCE_NAME=${{ secrets.STG_GCE_INSTANCE_NAME }}" >> "$GITHUB_ENV"
               echo "GCP_SA_EMAIL=${{ secrets.STG_GCP_SA_EMAIL }}" >> "$GITHUB_ENV"
               echo "GCP_WIF_PROVIDER=${{ secrets.STG_GCP_WIF_PROVIDER }}" >> "$GITHUB_ENV"
+              echo "DISCORD_WEBHOOK_URL=${{ secrets.STG_DISCORD_WEBHOOK_URL }}" >> "$GITHUB_ENV"
+              echo "ADDRESSES_TXT=${{ secrets.STG_ADDRESSES_TXT }}" >> "$GITHUB_ENV"
               ;;
             prd)
               echo "GCE_INSTANCE_NAME=${{ secrets.PRD_GCE_INSTANCE_NAME }}" >> "$GITHUB_ENV"
               echo "GCP_SA_EMAIL=${{ secrets.PRD_GCP_SA_EMAIL }}" >> "$GITHUB_ENV"
               echo "GCP_WIF_PROVIDER=${{ secrets.PRD_GCP_WIF_PROVIDER }}" >> "$GITHUB_ENV"
+              echo "DISCORD_WEBHOOK_URL=${{ secrets.PRD_DISCORD_WEBHOOK_URL }}" >> "$GITHUB_ENV"
+              echo "ADDRESSES_TXT=${{ secrets.PRD_ADDRESSES_TXT }}" >> "$GITHUB_ENV"
               ;;
           esac
 
@@ -55,11 +61,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gettext-base
-          export DISCORD_WEBHOOK_URL="${{ secrets.DISCORD_WEBHOOK_URL }}"
+          export DISCORD_WEBHOOK_URL="${{ env.DISCORD_WEBHOOK_URL }}"
           export NOTIFICATION_SUPPRESSION_SECONDS="${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || 600 }}"
           export DB_DIRECTORY="./data"
           # Add other variables here as needed
           envsubst < .env.template > .env
+          printf "%s" "${{ env.ADDRESSES_TXT }}" > addresses.txt
 
       # 3. Create artifact and Upload to GCE
       - name: Create and Upload Artifacts
@@ -104,4 +111,3 @@ jobs:
               sudo docker compose up -d --build
               sudo docker image prune -f || true
             "
-

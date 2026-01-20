@@ -1,136 +1,136 @@
 # hyperliquid-discord-monitor
-## Install
+## インストール
 
-### Prerequisites
+### 前提条件
 - Python 3.7+
-- pip package manager
+- pip パッケージマネージャー
 
-### Installation Steps
+### インストール手順
 
-1. Clone or download the project files
-2. Install required dependencies:
+1. プロジェクトを取得（clone または download）
+2. 依存関係をインストール:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Create a `.env` file in the project directory:
+3. プロジェクト直下に `.env` を作成:
 ```bash
 touch .env
 ```
 
-4. Add your Discord webhook URL to the `.env` file:
+4. `.env` に Discord Webhook URL を設定:
 ```
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your/webhook/url
 ```
 
-5. Create an `addresses.txt` file containing wallet addresses to monitor (one per line):
+5. 監視対象アドレスを記載した `addresses.txt` を作成（1行に1つ）:
 ```bash
 touch addresses.txt
 ```
 
-## Running with Docker (Recommended)
+## Docker で実行（推奨）
 
-Using Docker is recommended as it automates dependency and process management.
+Docker を使うと依存関係やプロセス管理を自動化できるため推奨です。
 
-### 1. Prerequisites
+### 1. 前提
 
 - [Docker](https://docs.docker.com/get-docker/)
 - [Docker Compose](https://docs.docker.com/compose/install/)
 
-### 2. Configuration
+### 2. 設定
 
-In the project's root directory, you need to prepare the following three items.
+プロジェクト直下に以下の 3 点を用意します。
 
-#### a) `addresses.txt` File
+#### a) `addresses.txt` ファイル
 
-Write the Hyperliquid addresses to monitor, one per line.
+監視する Hyperliquid アドレスを 1 行に 1 つ記述します。
 
-**Example of `addresses.txt`:**
+**`addresses.txt` の例:**
 ```
 0x1234567890abcdef1234567890abcdef12345678
 0xabcdef1234567890abcdef1234567890abcdef12
 ```
 
-#### b) `data` Directory
+#### b) `data` ディレクトリ
 
-This is used to permanently store the trade history database (SQLite file). It prevents data loss even if the container is restarted.
+取引履歴のデータベース（SQLite）を永続化するために使用します。コンテナ再起動時のデータ消失を防ぎます。
 
-Create it with the following command:
+以下のコマンドで作成します:
 ```bash
 mkdir data
 ```
 
-#### c) `.env` File
+#### c) `.env` ファイル
 
-Define the environment variables required for the application.
+アプリで必要な環境変数を定義します。
 
-- `DISCORD_WEBHOOK_URL`: **(Required)** Your Discord Webhook URL.
-- `DB_DIRECTORY`: **(Required for Docker)** Set this to `/app/data` to save the database in a persistent volume.
-- `NOTIFICATION_SUPPRESSION_SECONDS`: (Optional) Cooldown time in seconds between notifications for the same type of trade. Default is `60`.
+- `DISCORD_WEBHOOK_URL`: **(必須)** Discord Webhook URL
+- `DB_DIRECTORY`: **(Docker では必須)** 永続ボリュームに保存するため `/app/data` を指定
+- `NOTIFICATION_SUPPRESSION_SECONDS`: (任意) 同種の取引通知のクールダウン秒数（デフォルト `60`）
 
-**Example of `.env`:**
+**`.env` の例:**
 ```
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_id/your_webhook_token
 NOTIFICATION_SUPPRESSION_SECONDS=300
 DB_DIRECTORY=/app/data
 ```
 
-### 3. Running the Service
+### 3. サービスの起動
 
-Once the configuration is complete, manage the service with the following commands.
+設定が完了したら、以下のコマンドで管理します。
 
-- **Start the service in the background:**
+- **バックグラウンドで起動:**
   ```bash
   docker-compose up -d
   ```
 
-- **View logs in real-time:**
+- **ログをリアルタイム表示:**
   ```bash
   docker-compose logs -f
   ```
-  *(Pressing `Ctrl+C` will exit the log view, but the service will continue to run.)*
+  *(`Ctrl+C` でログ表示を終了しますが、サービスは継続します)*
 
-- **Stop the service:**
+- **停止:**
   ```bash
   docker-compose down
   ```
 
 ---
 
-## Usage
+## 使い方
 
-### Basic Usage
-Monitor addresses from the default `addresses.txt` file:
+### 基本
+デフォルトの `addresses.txt` を監視:
 ```bash
 python hyperliquid-discord-monitor.py addresses.txt
 ```
 
-Monitor addresses from a custom file:
+任意のファイルを指定:
 ```bash
 python hyperliquid-discord-monitor.py custom_addresses.txt
 ```
 
-### Daemon Mode
-Run the monitor as a background daemon:
+### デーモンモード
+バックグラウンドで実行:
 ```bash
 python hyperliquid-discord-monitor.py addresses.txt -d
 ```
 
-Or with a custom addresses file:
+任意ファイル指定:
 ```bash
 python hyperliquid-discord-monitor.py custom_addresses.txt -d
 ```
 
-## Example
+## 例
 
-### Setup Example
+### セットアップ例
 
-1. Create your environment file:
+1. 環境変数ファイルを作成:
 ```bash
 echo "DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/123456789/abcdefg" > .env
 ```
 
-2. Add wallet addresses to monitor:
+2. 監視するアドレスを追加:
 ```bash
 cat > addresses.txt << EOF
 0x1234567890abcdef1234567890abcdef12345678
@@ -141,8 +141,8 @@ EOF
 
 python hyperliquid-discord-monitor.py addresses.txt
 
-### Discord Message Example
-When a trade is detected, you'll receive Discord messages like:
+### Discord メッセージ例
+取引を検知すると以下のような通知が届きます:
 ```
 **[2024-01-15 14:30:25] New FILL**
 Address: https://hypurrscan.io/address/0x1234567890abcdef1234567890abcdef12345678
@@ -155,34 +155,34 @@ PnL: 🟢 125.75
 Hash: 0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab
 ```
 
-### File Structure
+### ファイル構成
 ```
 project/
 ├── hyperliquid-discord-monitor.py
 ├── .env
 ├── addresses.txt
-├── trades.db (created automatically)
+├── trades.db (自動生成)
 └── README.md
 ```
 
-### Environment Variables
-- `DISCORD_WEBHOOK_URL`: Your Discord webhook URL (required)
+### 環境変数
+- `DISCORD_WEBHOOK_URL`: Discord webhook URL（必須）
 
-### Address File Format
-The `addresses.txt` file should contain one Ethereum address per line:
+### アドレスファイル形式
+`addresses.txt` は 1 行に 1 つの Ethereum アドレスを記載します:
 ```
 0x1234567890abcdef1234567890abcdef12345678
 0xabcdef1234567890abcdef1234567890abcdef12
 0x9876543210fedcba9876543210fedcba98765432
 ```
 
-Empty lines are ignored, so you can add spacing for better readability.
+空行は無視されるため、可読性のために空行を挟んでも問題ありません。
 
-### Recommendation for Daemonization
-If you daemonize the process directly, it may go into a sleep state.
-Therefore, we recommend using Supervisord for proper process daemonization.
+### デーモン化の推奨
+プロセスを直接デーモン化するとスリープ状態に入る場合があります。
+安定した運用のため、Supervisord の利用を推奨します。
 
-example conf:
+例:
 ```bash
 $ cat /etc/supervisor/conf.d/hyperliquid-discord-monitor.conf
 [program:hyperliquid-discord-monitor]
@@ -207,25 +207,28 @@ sudo supervisorctl start hyperliquid-discord-monitor
 
 ---
 
-## GitHub Actions Deployment to GCE
+## GitHub Actions で GCE へデプロイ
 
-This project includes a GitHub Actions workflow (`.github/workflows/deploy.yml`) to automate deployment to a Google Compute Engine (GCE) instance using Workload Identity Federation. To use this, you need to configure the following GitHub Secrets and Variables in your repository settings (`Settings > Secrets and variables > Actions`).
+このプロジェクトには GitHub Actions ワークフロー（`.github/workflows/deploy.yml`）が含まれており、Workload Identity Federation を使って Google Compute Engine (GCE) へ自動デプロイします。利用には GitHub Secrets と Variables の設定が必要です（`Settings > Secrets and variables > Actions`）。
 
-### GitHub Secrets (Repository Secrets)
+### GitHub Secrets（Repository Secrets）
 
-These are sensitive credentials that should be stored securely as GitHub Secrets:
+以下は環境別（dev/stg/prd）に設定します:
 
-*   **`GCP_WIF_PROVIDER`**: The Workload Identity Federation provider resource name for your Google Cloud project (e.g., `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL_ID>/providers/<PROVIDER_ID>`).
-*   **`GCP_SA_EMAIL`**: The email address of the Google Cloud Service Account that GitHub Actions will use for authentication (e.g., `github-actions@<PROJECT_ID>.iam.gserviceaccount.com`). This Service Account needs appropriate permissions, including `Service Account User` role and permissions for `Compute Instance Admin (v1)` or specific `compute.instances.ssh` and `compute.instances.get` roles, along with permissions to write to the target directory on the GCE instance (if not using `sudo`).
-*   **`GCE_INSTANCE_NAME`**: The name of your GCE instance where the application will be deployed.
-*   **`GCE_ZONE`**: The Google Cloud zone where your GCE instance is located (e.g., `asia-northeast1-b`).
-*   **`DISCORD_WEBHOOK_URL`**: Your Discord Webhook URL for sending notifications.
+*   **`DEV_GCP_WIF_PROVIDER` / `STG_GCP_WIF_PROVIDER` / `PRD_GCP_WIF_PROVIDER`**: Workload Identity Federation の provider リソース名
+*   **`DEV_GCP_SA_EMAIL` / `STG_GCP_SA_EMAIL` / `PRD_GCP_SA_EMAIL`**: GitHub Actions が使用する Service Account のメールアドレス
+*   **`DEV_GCE_INSTANCE_NAME` / `STG_GCE_INSTANCE_NAME` / `PRD_GCE_INSTANCE_NAME`**: デプロイ対象の GCE インスタンス名
+*   **`DEV_DISCORD_WEBHOOK_URL` / `STG_DISCORD_WEBHOOK_URL` / `PRD_DISCORD_WEBHOOK_URL`**: Discord Webhook URL
+*   **`DEV_ADDRESSES_TXT` / `STG_ADDRESSES_TXT` / `PRD_ADDRESSES_TXT`**: `addresses.txt` の内容（複数行）
 
-### GitHub Variables (Repository Variables)
+以下は共通で設定します:
 
-This is for non-sensitive configuration that can be easily changed:
+*   **`GCE_ZONE`**: GCE インスタンスのゾーン（例: `asia-northeast1-b`）
 
-*   **`NOTIFICATION_SUPPRESSION_SECONDS`**: (Optional) Cooldown time in seconds between notifications for the same type of trade. Defaults to `600` if not set.
+### GitHub Variables（Repository Variables）
 
-**Note:** The deployment workflow assumes the application will be deployed to `/opt/apps/hdm` on the GCE instance. Ensure this directory exists and the service account has the necessary permissions to write to it (or relies on `sudo` as configured in the workflow).
+非機密の設定値です:
 
+*   **`NOTIFICATION_SUPPRESSION_SECONDS`**: (任意) 同種通知のクールダウン秒数。未設定時は `600`
+
+**注意:** デプロイ先は `/opt/apps/hdm` を想定しています。ディレクトリが存在しない場合は作成されます。必要に応じて権限設定（`sudo`）を確認してください。
