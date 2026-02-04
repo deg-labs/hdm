@@ -105,6 +105,7 @@ jobs:
               TARGET_DIR='/opt/apps/hdm'
 
               # 1) Ensure target directory exists and is owned by current user
+              sudo rm -rf \"\$TARGET_DIR\"
               sudo mkdir -p \"\$TARGET_DIR\"
               sudo chown -R \$(id -u):\$(id -g) \"\$TARGET_DIR\"
 
