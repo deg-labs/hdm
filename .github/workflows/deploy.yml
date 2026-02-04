@@ -74,7 +74,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gettext-base
           export DISCORD_WEBHOOK_URL="${{ env.DISCORD_WEBHOOK_URL }}"
-          export NOTIFICATION_SUPPRESSION_SECONDS="${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || 600 }}"
+          export NOTIFICATION_SUPPRESSION_SECONDS="${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || 3600 }}"
           export DB_DIRECTORY="./data"
           # Add other variables here as needed
           envsubst < .env.template > .env
