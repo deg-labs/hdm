@@ -10,9 +10,10 @@ RUN pip install --upgrade pip && \
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN getent group nobody || groupadd nobody
-RUN chown -R nobody:nobody /app
-USER nobody
+RUN groupadd -g 1000 appuser || true
+RUN useradd -m -u 1000 -g 1000 -s /bin/sh appuser || true
+RUN chown -R 1000:1000 /app
+USER 1000:1000
 
 COPY hdm.py .
 COPY src ./src
