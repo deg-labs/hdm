@@ -2,3 +2,4 @@ addresses
 .env
 trades*.db
 data
+__pycache__
