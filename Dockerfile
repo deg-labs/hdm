@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends procps
+RUN apt-get update && apt-get install -y --no-install-recommends procps ca-certificates
 
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
@@ -10,12 +10,14 @@ RUN pip install --upgrade pip && \
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN getent group nobody || groupadd nobody
-RUN chown -R nobody:nobody /app
-USER nobody
+RUN groupadd -g 1000 appuser || true
+RUN useradd -m -u 1000 -g 1000 -s /bin/sh appuser || true
+RUN chown -R 1000:1000 /app
+USER 1000:1000
 
-COPY hyperliquid-discord-monitor.py .
+COPY hdm.py .
+COPY src ./src
 COPY addresses.txt .
 COPY .env .
 
-CMD ["python", "hyperliquid-discord-monitor.py", "addresses.txt"]
+CMD ["python", "hdm.py", "addresses.txt"]

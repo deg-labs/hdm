@@ -2,13 +2,13 @@ services:
   hdm:
     build: .
     restart: always
-    user: "65534:65534"
+    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       - TZ=Asia/Tokyo
     env_file:
       - ./.env
     volumes:
-      # - ./data:/app/data # If you want to persist data outside the container
+      # - ./data:/app/data
       - ./addresses.txt:/app/addresses.txt # If you want to manage addresses.txt outside the container
     mem_limit: 512m
     cpus: 0.5
@@ -23,4 +23,3 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
-
