@@ -8,14 +8,17 @@ import subprocess
 import asyncio
 import threading
 from websocket._exceptions import WebSocketConnectionClosedException
-from hyperliquid_monitor.monitor import HyperliquidMonitor
-from hyperliquid_monitor.types import Trade
 from datetime import datetime, timezone
 from collections import defaultdict
 import requests
 import json
+import sqlite3
 from dotenv import load_dotenv
 from hyperliquid.info import Info
+
+from .addresses import load_addresses
+from .models import Trade
+from .ws_monitor import HyperliquidUserFillsMonitor
 
 load_dotenv()
 
@@ -45,17 +48,6 @@ HYPERLIQUID_REQUEST_TIMEOUT = 10
 processed_trades = set()
 startup_grace_period = {}
 
-original_signal = signal.signal
-
-def patched_signal(sig, handler):
-    """スレッド内でのシグナル設定を無効化"""
-    if threading.current_thread() != threading.main_thread():
-        # メインスレッド以外では何もしない
-        return None
-    return original_signal(sig, handler)
-
-signal.signal = patched_signal
-
 def touch_healthcheck_file():
     """ヘルスチェックファイルをtouch"""
     try:
@@ -76,15 +68,22 @@ def send_to_discord(webhook_url: str, message: str = None, embed: dict = None):
     headers = {
         "Content-Type": "application/json"
     }
-    try:
-        response = requests.post(
-            webhook_url,
-            data=json.dumps(payload),
-            headers=headers
-        )
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        sys.stderr.write(f"Failed to send message to Discord: {e}\n")
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                webhook_url,
+                data=json.dumps(payload),
+                headers=headers,
+                timeout=10
+            )
+            response.raise_for_status()
+            return
+        except requests.exceptions.RequestException as e:
+            if attempt == max_attempts:
+                sys.stderr.write(f"Failed to send message to Discord after {max_attempts} attempts: {e}\n")
+                return
+            time.sleep(2 ** (attempt - 1))
 
 def fetch_spot_meta_index_map():
     global spot_meta_index_cache
@@ -246,9 +245,11 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     if address_startup_time and (current_time - address_startup_time) < 60:
         print(f"[{address_suffix}] Startup grace period - skipping historical trade: {trade.tx_hash}")
         processed_trades.add(trade_key)
+        record_trade_in_db(db_path, trade)
         return
     
-    if os.path.exists(db_path) and check_trade_exists_in_db(db_path, trade.tx_hash):
+    ensure_trades_table(db_path)
+    if check_trade_exists_in_db(db_path, trade.tx_hash):
         print(f"[{address_suffix}] Trade {trade.tx_hash} already exists in DB, skipping notification")
         processed_trades.add(trade_key)
         return
@@ -260,15 +261,15 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     if last_time and (current_time - last_time) < NOTIFICATION_SUPPRESSION_SECONDS:
         print(f"[{address_suffix}] Notification for {trade.coin} {trade.direction} suppressed. Last notification was at {datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S')}")
         processed_trades.add(trade_key)
+        record_trade_in_db(db_path, trade)
         return
 
     # 新しいトレードとして処理
     processed_trades.add(trade_key)
+    record_trade_in_db(db_path, trade)
     
     trade_cache[trade.tx_hash].append(trade)
     trades = trade_cache[trade.tx_hash]
-    total_size = sum(t.size for t in trades)
-    timestamp = trade.timestamp.strftime('%Y-%m-%d %H:%M:%S')
 
     if len(trades) == 1:
         embed = build_trade_embed(trade, tag)
@@ -283,41 +284,103 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         # 通知を送信したら、時刻を更新
         last_notification_time[suppression_key] = current_time
 
+def ensure_trades_table(db_path: str) -> None:
+    try:
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    tx_hash TEXT PRIMARY KEY,
+                    address TEXT NOT NULL,
+                    coin TEXT,
+                    direction TEXT,
+                    timestamp TEXT,
+                    seen_at INTEGER NOT NULL
+                )
+            """)
+    except sqlite3.Error as e:
+        print(f"SQLite error ensuring DB schema ({os.path.abspath(db_path)}): {e}")
+
+def record_trade_in_db(db_path: str, trade: Trade) -> None:
+    if not trade.tx_hash:
+        return False
+    try:
+        ensure_trades_table(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO trades (tx_hash, address, coin, direction, timestamp, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade.tx_hash,
+                    trade.address,
+                    trade.coin,
+                    trade.direction,
+                    trade.timestamp.isoformat() if trade.timestamp else None,
+                    int(time.time()),
+                ),
+            )
+        return True
+    except sqlite3.Error as e:
+        print(f"SQLite error storing trade in DB ({os.path.abspath(db_path)}): {e}")
+        return False
+
+def bootstrap_seen_fills(address: str, db_path: str) -> None:
+    """
+    Seed recent fills into DB once when DB is empty.
+    This prevents replay notifications right after down/up.
+    """
+    ensure_trades_table(db_path)
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM trades")
+            if cur.fetchone()[0] > 0:
+                return
+    except sqlite3.Error as e:
+        print(f"[{address[-8:]}] Failed to inspect DB for bootstrap: {e}")
+        return
+
+    info = Info(skip_ws=True)
+    try:
+        fills = info.user_fills(address) or []
+    except Exception as e:
+        print(f"[{address[-8:]}] Failed to bootstrap user_fills: {e}")
+        return
+    finally:
+        try:
+            if hasattr(info, "ws_manager") and info.ws_manager:
+                info.ws_manager.stop()
+        except Exception:
+            pass
+
+    seeded = 0
+    for fill in fills:
+        if not isinstance(fill, dict):
+            continue
+        tx_hash = fill.get("hash")
+        if not tx_hash:
+            continue
+        trade = HyperliquidUserFillsMonitor.build_trade_from_fill(fill, address)
+        if record_trade_in_db(db_path, trade):
+            seeded += 1
+    print(f"[{address[-8:]}] Bootstrap seeded {seeded} fills into DB (no notifications).")
+
 def check_trade_exists_in_db(db_path: str, tx_hash: str) -> bool:
     """DBに指定されたtx_hashのトレードが既に存在するかチェック"""
-    import sqlite3
     try:
         # DBファイルが存在しない場合は存在しないと判定
         if not os.path.exists(db_path):
             return False
-            
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # テーブルの存在確認
-        cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name='trades'
-        """)
-        
-        if not cursor.fetchone():
-            conn.close()
-            return False  # ログ出力を削除（起動時の大量出力を防ぐ）
-        
-        # tx_hash列の存在確認
-        cursor.execute("PRAGMA table_info(trades)")
-        columns = [column[1] for column in cursor.fetchall()]
-        
-        if 'tx_hash' not in columns:
-            conn.close()
-            return False
-        
-        # tradesテーブルでtx_hashをチェック
-        cursor.execute("SELECT COUNT(*) FROM trades WHERE tx_hash = ?", (tx_hash,))
-        count = cursor.fetchone()[0]
-        
-        conn.close()
-        return count > 0
+        ensure_trades_table(db_path)
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM trades WHERE tx_hash = ? LIMIT 1", (tx_hash,))
+            row = cursor.fetchone()
+            return row is not None
         
     except sqlite3.Error as e:
         print(f"SQLite error checking trade in DB: {e}")
@@ -351,24 +414,6 @@ def run_test_preview(
         print("WARNING: Discord posting is ENABLED for this test.")
     print(f"Printing up to {max_entries} fills")
 
-    def build_trade_from_fill(fill, address):
-        timestamp = datetime.fromtimestamp(int(fill.get("time", 0)) / 1000)
-        return Trade(
-            timestamp=timestamp,
-            address=address,
-            coin=fill.get("coin", "Unknown"),
-            side="BUY" if fill.get("side", "B") == "A" else "SELL",
-            size=float(fill.get("sz", 0)),
-            price=float(fill.get("px", 0)),
-            trade_type="FILL",
-            direction=fill.get("dir"),
-            tx_hash=fill.get("hash"),
-            fee=float(fill.get("fee", 0)),
-            fee_token=fill.get("feeToken"),
-            start_position=float(fill.get("startPosition", 0)),
-            closed_pnl=float(fill.get("closedPnl", 0))
-        )
-
     def callback(msg):
         nonlocal count
         if not isinstance(msg, dict):
@@ -395,7 +440,7 @@ def run_test_preview(
                 printed_per_address[address] += 1
                 if printed_per_address[address] >= 1 and address in pending:
                     pending.remove(address)
-            trade = build_trade_from_fill(fill, address)
+            trade = HyperliquidUserFillsMonitor.build_trade_from_fill(fill, address)
             info = addresses.get(trade.address)
             tag = info.get('tag') if info else None
             specific_webhook = info.get('webhook') if info else None
@@ -434,32 +479,6 @@ def run_test_preview(
     if printed < max_entries:
         print(f"\nTimeout reached. Printed {printed}/{max_entries} fills.")
 
-def load_addresses(file_path: str) -> dict:
-    addresses = {}
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                parts = [p.strip() for p in line.split(',')]
-                address = parts[0].lower()
-                
-                if address:
-                    tag = parts[1] if len(parts) > 1 and parts[1] else None
-                    webhook = parts[2] if len(parts) > 2 and parts[2] else None
-                    addresses[address] = {'tag': tag, 'webhook': webhook}
-    except IOError as e:
-        sys.stderr.write(f"Error reading addresses file: {e}\n")
-        sys.exit(1)
-
-    if not addresses:
-        sys.stderr.write("No addresses found in addresses file\n")
-        sys.exit(1)
-
-    return addresses
-
 def write_pidfile(pidfile):
     try:
         with open(pidfile, 'w') as f:
@@ -484,6 +503,8 @@ async def monitor_address_async(webhook_url: str, address: str, info: dict, addr
     specific_webhook_url = info.get('webhook')
     
     db_path = os.path.join(DB_DIRECTORY, f"trades_{address[-8:]}.db")
+    ensure_trades_table(db_path)
+    bootstrap_seen_fills(address, db_path)
 
     # Create a shared state object for communication between threads
     shared_state = {
@@ -514,9 +535,8 @@ async def monitor_address_async(webhook_url: str, address: str, info: dict, addr
             
             startup_grace_period[address] = time.time()
             
-            monitor = HyperliquidMonitor(
+            monitor = HyperliquidUserFillsMonitor(
                 addresses=[address],
-                db_path=db_path,
                 callback=monitor_callback
             )
             monitor_instances[address] = monitor
@@ -638,10 +658,7 @@ async def run_multi_monitor_async(webhook_url: str, addresses: dict):
 def signal_handler(signum, frame):
     global monitor_instances, main_loop
     print(f"Received signal {signum}, shutting down...")
-    
-    # パッチを元に戻す
-    signal.signal = original_signal
-    
+
     # すべての監視インスタンスを停止
     for address, monitor in monitor_instances.items():
         try:
