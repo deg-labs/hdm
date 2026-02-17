@@ -15,7 +15,6 @@ from collections import defaultdict
 import requests
 import json
 from dotenv import load_dotenv
-from types import SimpleNamespace
 from hyperliquid.info import Info
 
 load_dotenv()
@@ -326,67 +325,6 @@ def check_trade_exists_in_db(db_path: str, tx_hash: str) -> bool:
     except Exception as e:
         print(f"Error checking trade in DB: {e}")
         return False
-
-def parse_trade_timestamp(value):
-    if value is None:
-        return datetime.utcnow()
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value)
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            try:
-                return datetime.fromtimestamp(float(value))
-            except ValueError:
-                return datetime.utcnow()
-    return datetime.utcnow()
-
-def load_latest_trade_from_db(db_path: str):
-    import sqlite3
-    try:
-        if not os.path.exists(db_path):
-            return None
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name='trades'
-        """)
-        if not cursor.fetchone():
-            conn.close()
-            return None
-        cursor.execute("PRAGMA table_info(trades)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if not columns:
-            conn.close()
-            return None
-        order_by = "timestamp DESC" if "timestamp" in columns else "rowid DESC"
-        cursor.execute(f"SELECT * FROM trades ORDER BY {order_by} LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
-        if not row:
-            return None
-        data = dict(zip(columns, row))
-        timestamp = parse_trade_timestamp(data.get("timestamp"))
-        trade = SimpleNamespace(
-            timestamp=timestamp,
-            address=data.get("address"),
-            coin=data.get("coin"),
-            side=data.get("side") or "BUY",
-            size=float(data.get("size") or 0),
-            price=float(data.get("price") or 0),
-            trade_type=data.get("trade_type") or "FILL",
-            direction=data.get("direction") or "",
-            tx_hash=data.get("tx_hash"),
-            closed_pnl=float(data.get("closed_pnl")) if data.get("closed_pnl") is not None else None,
-        )
-        if not trade.address or not trade.coin:
-            return None
-        return trade
-    except Exception as e:
-        print(f"Error loading latest trade from DB {db_path}: {e}")
-        return None
 
 def run_test_preview(addresses_file: str, enable_posting: bool = False):
     if not os.path.exists(addresses_file):
