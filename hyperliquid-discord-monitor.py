@@ -326,14 +326,19 @@ def check_trade_exists_in_db(db_path: str, tx_hash: str) -> bool:
         print(f"Error checking trade in DB: {e}")
         return False
 
-def run_test_preview(addresses_file: str, enable_posting: bool = False):
+def run_test_preview(
+    addresses_file: str,
+    enable_posting: bool = False,
+    timeout_seconds: int = None,
+    max_entries: int = None
+):
     if not os.path.exists(addresses_file):
         print(f"Addresses file not found: {addresses_file}")
         return
 
     addresses = load_addresses(addresses_file)
-    timeout_seconds = int(os.getenv("TEST_PREVIEW_TIMEOUT_SECONDS", 60))
-    max_entries = int(os.getenv("TEST_PREVIEW_MAX_ENTRIES", 10))
+    timeout_seconds = int(timeout_seconds if timeout_seconds is not None else os.getenv("TEST_PREVIEW_TIMEOUT_SECONDS", 60))
+    max_entries = int(max_entries if max_entries is not None else os.getenv("TEST_PREVIEW_MAX_ENTRIES", 10))
     count = 0
     seen_hashes = set()
     pending = set(addresses.keys())
@@ -660,7 +665,7 @@ def start_daemon(script_path, addresses_file):
     
     remove_pidfile(pidfile)
     
-    cmd = [sys.executable, script_path, addresses_file, '--background']
+    cmd = [sys.executable, script_path, 'monitor', addresses_file, '--background']
     
     print(f"Starting multi-address daemon with command: {' '.join(cmd)}")
     print(f"Logs will be written to: {log_file}")
@@ -742,41 +747,104 @@ def run_monitor(webhook_url: str, addresses_file: str, background_mode: bool = F
                 pass
         monitor_instances.clear()
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Hyperliquid Trade Monitor (Multi-Address WebSocket Support)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument(
-        "command_or_file",
-        nargs="+",
-        help="Path to addresses file, OR 'tests' to run preview, OR 'tests post' to preview and post to Discord"
+
+    subparsers = parser.add_subparsers(dest="command", metavar="command")
+
+    monitor_parser = subparsers.add_parser(
+        "monitor",
+        help="Run trade monitor",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument(
+    monitor_parser.add_argument(
+        "addresses_file",
+        nargs="?",
+        default="addresses.txt",
+        help="Path to addresses file"
+    )
+    monitor_parser.add_argument(
         "-d", "--daemon",
         action="store_true",
         help="Run as background daemon (single process monitoring all addresses)"
     )
-    parser.add_argument(
+    monitor_parser.add_argument(
         "--background",
         action="store_true",
-        help=argparse.SUPPRESS
+        help="Internal flag used by daemon child process"
+    )
+    monitor_parser.add_argument(
+        "--webhook-url",
+        help="Override DISCORD_WEBHOOK_URL environment variable"
     )
 
-    if len(sys.argv) == 1:
+    tests_parser = subparsers.add_parser(
+        "tests",
+        help="Preview recent fills without running full monitor",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    tests_parser.add_argument(
+        "-f", "--addresses-file",
+        default="addresses.txt",
+        help="Path to addresses file used in preview"
+    )
+    tests_parser.add_argument(
+        "--post",
+        action="store_true",
+        help="Also post preview messages to Discord"
+    )
+    tests_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=int(os.getenv("TEST_PREVIEW_TIMEOUT_SECONDS", 60)),
+        help="Seconds to wait before stopping preview"
+    )
+    tests_parser.add_argument(
+        "--max-entries",
+        type=int,
+        default=int(os.getenv("TEST_PREVIEW_MAX_ENTRIES", 10)),
+        help="Maximum fills to print before stopping preview"
+    )
+    tests_parser.add_argument(
+        "legacy_action",
+        nargs="?",
+        choices=["post"],
+        help="Legacy positional mode (equivalent to --post)"
+    )
+    return parser
+
+def parse_args():
+    parser = build_parser()
+    argv = sys.argv[1:]
+
+    # Backward compatibility: `python script.py addresses.txt`
+    if argv and argv[0] not in {"monitor", "tests"} and not argv[0].startswith("-"):
+        argv = ["monitor", *argv]
+
+    if not argv:
         parser.print_help()
         sys.exit(0)
 
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
-    # Handle "tests" command
-    if args.command_or_file[0] == "tests":
-        enable_posting = len(args.command_or_file) > 1 and args.command_or_file[1] == "post"
-        run_test_preview("addresses.txt", enable_posting=enable_posting)
+def main():
+    args = parse_args()
+
+    if args.command == "tests":
+        enable_posting = args.post or args.legacy_action == "post"
+        run_test_preview(
+            args.addresses_file,
+            enable_posting=enable_posting,
+            timeout_seconds=args.timeout_seconds,
+            max_entries=args.max_entries
+        )
         sys.exit(0)
 
-    addresses_file = args.command_or_file[0]
-    webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+    addresses_file = args.addresses_file
+    webhook_url = args.webhook_url or os.getenv('DISCORD_WEBHOOK_URL')
     if not webhook_url:
         sys.stderr.write("Error: DISCORD_WEBHOOK_URL not found in environment variables.\n")
         sys.stderr.write("Please create a .env file with DISCORD_WEBHOOK_URL=your_webhook_url\n")
