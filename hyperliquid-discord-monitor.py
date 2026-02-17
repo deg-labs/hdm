@@ -208,7 +208,7 @@ Price: {trade.price}
 Direction: {display_direction}
 
 Address: https://hypurrscan.io/address/{trade.address}
-Trade.xyz: https://app.trade.xyz/?market={trade.coin}-{collateral_ticker}&ghost={trade.address}"""
+Ghost: https://app.hyperliquid.xyz/trade/{trade.coin}/{collateral_ticker}?hloa={trade.address}"""
 
     return {
         "title": title,
