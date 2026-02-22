@@ -21,11 +21,18 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.ORG_GH_APP_ID }}
+          private-key: ${{ secrets.ORG_GH_APP_PRIVATE_KEY }}
+          owner: deg-labs
+
       - name: Guard deploy actor is deg-develop member
         env:
           DEPLOY_ACTOR: ${{ github.actor }}
-          ORG_TEAM_READ_TOKEN: ${{ secrets.ORG_TEAM_READ_TOKEN }}
-          GH_TOKEN: ${{ secrets.ORG_TEAM_READ_TOKEN != '' && secrets.ORG_TEAM_READ_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -34,12 +41,10 @@ jobs:
             exit 1
           fi
 
-          # Fetch current team members dynamically from GitHub API.
-          # Recommended: set ORG_TEAM_READ_TOKEN secret (PAT/App token with read:org)
-          # for private team visibility.
+          # Fetch current team members dynamically from GitHub API using GitHub App token.
           if ! TEAM_MEMBERS="$(gh api orgs/deg-labs/teams/deg-develop/members --jq '.[].login')"; then
             echo "Failed to fetch deg-labs/deg-develop members via GitHub API."
-            echo "Set repository secret ORG_TEAM_READ_TOKEN with read:org permission if needed."
+            echo "Check ORG_GH_APP_ID / ORG_GH_APP_PRIVATE_KEY and app permissions (Members: Read)."
             exit 1
           fi
 
