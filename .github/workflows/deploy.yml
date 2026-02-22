@@ -24,13 +24,32 @@ jobs:
       - name: Guard deploy actor is deg-develop member
         env:
           DEPLOY_ACTOR: ${{ github.actor }}
+          ORG_TEAM_READ_TOKEN: ${{ secrets.ORG_TEAM_READ_TOKEN }}
+          GH_TOKEN: ${{ secrets.ORG_TEAM_READ_TOKEN != '' && secrets.ORG_TEAM_READ_TOKEN || github.token }}
         run: |
-          # Keep this list aligned with deg-labs/deg-develop team members.
-          ALLOWED_MEMBERS="wakiyamap tacotokyo haturatu tawashi-lab tetsu-ttt"
-          if [[ " $ALLOWED_MEMBERS " != *" $DEPLOY_ACTOR "* ]]; then
-            echo "Actor '$DEPLOY_ACTOR' is not in deg-labs/deg-develop. Deployment is blocked."
+          set -euo pipefail
+
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "GitHub CLI (gh) is required but not installed."
             exit 1
           fi
+
+          # Fetch current team members dynamically from GitHub API.
+          # Recommended: set ORG_TEAM_READ_TOKEN secret (PAT/App token with read:org)
+          # for private team visibility.
+          if ! TEAM_MEMBERS="$(gh api orgs/deg-labs/teams/deg-develop/members --jq '.[].login')"; then
+            echo "Failed to fetch deg-labs/deg-develop members via GitHub API."
+            echo "Set repository secret ORG_TEAM_READ_TOKEN with read:org permission if needed."
+            exit 1
+          fi
+
+          if ! grep -Fxq "$DEPLOY_ACTOR" <<<"$TEAM_MEMBERS"; then
+            echo "Actor '$DEPLOY_ACTOR' is not in deg-labs/deg-develop. Deployment is blocked."
+            echo "Team members fetched from API:"
+            echo "$TEAM_MEMBERS"
+            exit 1
+          fi
+
           echo "Actor '$DEPLOY_ACTOR' is allowed to deploy."
 
       - name: Set environment vars by label
