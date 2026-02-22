@@ -21,6 +21,18 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Guard deploy actor is deg-develop member
+        env:
+          DEPLOY_ACTOR: ${{ github.actor }}
+        run: |
+          # Keep this list aligned with deg-labs/deg-develop team members.
+          ALLOWED_MEMBERS="wakiyamap tacotokyo haturatu tawashi-lab tetsu-ttt"
+          if [[ " $ALLOWED_MEMBERS " != *" $DEPLOY_ACTOR "* ]]; then
+            echo "Actor '$DEPLOY_ACTOR' is not in deg-labs/deg-develop. Deployment is blocked."
+            exit 1
+          fi
+          echo "Actor '$DEPLOY_ACTOR' is allowed to deploy."
+
       - name: Set environment vars by label
         run: |
           case "${{ github.event.label.name }}" in
