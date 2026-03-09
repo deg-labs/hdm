@@ -104,15 +104,6 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v3
 
-      - name: Configure gcloud for deploy
-        run: |
-          set -euo pipefail
-          if [ -n "${{ steps.auth.outputs.project_id }}" ]; then
-            gcloud config set project "${{ steps.auth.outputs.project_id }}"
-          fi
-          gcloud config set auth/impersonate_service_account "${{ env.GCP_SA_EMAIL }}"
-          gcloud auth list --filter=status:ACTIVE --format="value(account)"
-
       # 2. Generate .env from secrets
       - name: Generate .env
         run: |
@@ -139,8 +130,7 @@ jobs:
           
           # Upload .env and app.tar.gz to GCE home directory
           gcloud compute scp .env /tmp/app.tar.gz ${{ env.GCE_INSTANCE_NAME }}:~ \
-            --zone ${{ secrets.GCE_ZONE }} \
-            --impersonate-service-account "${{ env.GCP_SA_EMAIL }}"
+            --zone ${{ secrets.GCE_ZONE }}
 
       # 4. SSH to Deploy
       - name: Deploy on GCE
@@ -148,7 +138,6 @@ jobs:
           set -euo pipefail
           gcloud compute ssh ${{ env.GCE_INSTANCE_NAME }} \
             --zone ${{ secrets.GCE_ZONE }} \
-            --impersonate-service-account "${{ env.GCP_SA_EMAIL }}" \
             --command "
               set -e
               TARGET_DIR='/opt/apps/hdm'
