@@ -48,6 +48,18 @@ HYPERLIQUID_REQUEST_TIMEOUT = 10
 processed_trades = set()
 startup_grace_period = {}
 
+def make_trade_uid(trade: Trade) -> str:
+    timestamp = trade.timestamp.isoformat() if trade.timestamp else ""
+    return "|".join([
+        trade.address or "",
+        trade.tx_hash or "",
+        trade.coin or "",
+        trade.direction or "",
+        timestamp,
+        f"{trade.price}",
+        f"{trade.size}",
+    ])
+
 def touch_healthcheck_file():
     """ヘルスチェックファイルをtouch"""
     try:
@@ -231,7 +243,7 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     touch_healthcheck_file()
 
     address_suffix = trade.address[-8:]
-    trade_key = f"{trade.address}:{trade.tx_hash}"
+    trade_key = make_trade_uid(trade)
     
     # メモリベースの重複チェック
     if trade_key in processed_trades:
@@ -249,7 +261,7 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         return
     
     ensure_trades_table(db_path)
-    if check_trade_exists_in_db(db_path, trade.tx_hash):
+    if check_trade_exists_in_db(db_path, trade):
         print(f"[{address_suffix}] Trade {trade.tx_hash} already exists in DB, skipping notification")
         processed_trades.add(trade_key)
         return
@@ -268,21 +280,16 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     processed_trades.add(trade_key)
     record_trade_in_db(db_path, trade)
     
-    trade_cache[trade.tx_hash].append(trade)
-    trades = trade_cache[trade.tx_hash]
+    embed = build_trade_embed(trade, tag)
 
-    if len(trades) == 1:
-        embed = build_trade_embed(trade, tag)
-        
-        print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
-        send_to_discord(webhook_url, embed=embed)
-        
-        if specific_webhook_url:
-            print(f"[{address_suffix}] Sending Discord notification to specific webhook: {trade.tx_hash}")
-            send_to_discord(specific_webhook_url, embed=embed)
+    print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
+    send_to_discord(webhook_url, embed=embed)
 
-        # 通知を送信したら、時刻を更新
-        last_notification_time[suppression_key] = current_time
+    if specific_webhook_url:
+        print(f"[{address_suffix}] Sending Discord notification to specific webhook: {trade.tx_hash}")
+        send_to_discord(specific_webhook_url, embed=embed)
+
+    last_notification_time[suppression_key] = current_time
 
 def ensure_trades_table(db_path: str) -> None:
     try:
@@ -292,7 +299,8 @@ def ensure_trades_table(db_path: str) -> None:
         with sqlite3.connect(db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
-                    tx_hash TEXT PRIMARY KEY,
+                    trade_uid TEXT,
+                    tx_hash TEXT,
                     address TEXT NOT NULL,
                     coin TEXT,
                     direction TEXT,
@@ -300,21 +308,73 @@ def ensure_trades_table(db_path: str) -> None:
                     seen_at INTEGER NOT NULL
                 )
             """)
+
+            columns_info = list(conn.execute("PRAGMA table_info(trades)"))
+            columns = {row[1] for row in columns_info}
+            tx_hash_is_primary = any(row[1] == "tx_hash" and row[5] == 1 for row in columns_info)
+
+            if tx_hash_is_primary:
+                conn.execute("ALTER TABLE trades RENAME TO trades_legacy")
+                conn.execute("""
+                    CREATE TABLE trades (
+                        trade_uid TEXT,
+                        tx_hash TEXT,
+                        address TEXT NOT NULL,
+                        coin TEXT,
+                        direction TEXT,
+                        timestamp TEXT,
+                        seen_at INTEGER NOT NULL
+                    )
+                """)
+                conn.execute("""
+                    INSERT OR IGNORE INTO trades (trade_uid, tx_hash, address, coin, direction, timestamp, seen_at)
+                    SELECT
+                        address || '|' || COALESCE(tx_hash, '') || '|' || COALESCE(coin, '') || '|' ||
+                        COALESCE(direction, '') || '|' || COALESCE(timestamp, ''),
+                        tx_hash,
+                        address,
+                        coin,
+                        direction,
+                        timestamp,
+                        seen_at
+                    FROM trades_legacy
+                """)
+                conn.execute("DROP TABLE trades_legacy")
+                columns = {"trade_uid", "tx_hash", "address", "coin", "direction", "timestamp", "seen_at"}
+
+            if "trade_uid" not in columns:
+                conn.execute("ALTER TABLE trades ADD COLUMN trade_uid TEXT")
+
+            conn.execute("""
+                UPDATE trades
+                SET trade_uid = COALESCE(
+                    trade_uid,
+                    address || '|' || COALESCE(tx_hash, '') || '|' || COALESCE(coin, '') || '|' ||
+                    COALESCE(direction, '') || '|' || COALESCE(timestamp, '')
+                )
+                WHERE trade_uid IS NULL
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_trade_uid
+                ON trades(trade_uid)
+            """)
     except sqlite3.Error as e:
         print(f"SQLite error ensuring DB schema ({os.path.abspath(db_path)}): {e}")
 
 def record_trade_in_db(db_path: str, trade: Trade) -> None:
     if not trade.tx_hash:
         return False
+    trade_uid = make_trade_uid(trade)
     try:
         ensure_trades_table(db_path)
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO trades (tx_hash, address, coin, direction, timestamp, seen_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO trades (trade_uid, tx_hash, address, coin, direction, timestamp, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    trade_uid,
                     trade.tx_hash,
                     trade.address,
                     trade.coin,
@@ -369,19 +429,41 @@ def bootstrap_seen_fills(address: str, db_path: str) -> None:
             seeded += 1
     print(f"[{address[-8:]}] Bootstrap seeded {seeded} fills into DB (no notifications).")
 
-def check_trade_exists_in_db(db_path: str, tx_hash: str) -> bool:
-    """DBに指定されたtx_hashのトレードが既に存在するかチェック"""
+def check_trade_exists_in_db(db_path: str, trade: Trade) -> bool:
+    """DBに指定されたfill相当のトレードが既に存在するかチェック"""
     try:
-        # DBファイルが存在しない場合は存在しないと判定
         if not os.path.exists(db_path):
             return False
         ensure_trades_table(db_path)
+        trade_uid = make_trade_uid(trade)
+        timestamp = trade.timestamp.isoformat() if trade.timestamp else None
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM trades WHERE tx_hash = ? LIMIT 1", (tx_hash,))
+            cursor.execute(
+                """
+                SELECT 1
+                FROM trades
+                WHERE trade_uid = ?
+                   OR (
+                        tx_hash = ?
+                    AND address = ?
+                    AND coin = ?
+                    AND direction = ?
+                    AND timestamp = ?
+                   )
+                LIMIT 1
+                """,
+                (
+                    trade_uid,
+                    trade.tx_hash,
+                    trade.address,
+                    trade.coin,
+                    trade.direction,
+                    timestamp,
+                ),
+            )
             row = cursor.fetchone()
             return row is not None
-        
     except sqlite3.Error as e:
         print(f"SQLite error checking trade in DB: {e}")
         return False
@@ -495,162 +577,156 @@ def remove_pidfile(pidfile):
     except OSError as e:
         print(f"Error removing pidfile: {e}")
 
-async def monitor_address_async(webhook_url: str, address: str, info: dict, address_index: int):
-    """非同期で単一アドレスを監視し、切断時に自動再接続する"""
+async def monitor_addresses_async(webhook_url: str, addresses: dict):
+    """複数アドレスを単一 WebSocket 接続で監視し、切断時に自動再接続する"""
     global startup_grace_period, monitor_instances
 
-    tag = info.get('tag')
-    specific_webhook_url = info.get('webhook')
-    
-    db_path = os.path.join(DB_DIRECTORY, f"trades_{address[-8:]}.db")
-    ensure_trades_table(db_path)
-    bootstrap_seen_fills(address, db_path)
+    address_state = {}
+    for address, info in addresses.items():
+        db_path = os.path.join(DB_DIRECTORY, f"trades_{address[-8:]}.db")
+        ensure_trades_table(db_path)
+        bootstrap_seen_fills(address, db_path)
+        address_state[address] = {
+            'tag': info.get('tag'),
+            'webhook': info.get('webhook'),
+            'db_path': db_path,
+        }
 
-    # Create a shared state object for communication between threads
     shared_state = {
         'last_trade_time': time.time(),
         'connection_dead': threading.Event()
     }
 
-    def create_callback(addr, db_file, tag_param, specific_webhook_param):
-        def callback(trade):
-            # Update the timestamp on each new trade
-            shared_state['last_trade_time'] = time.time()
-            return process_trade_with_db(webhook_url, trade, db_file, tag_param, specific_webhook_param)
-        return callback
+    def monitor_callback(trade):
+        shared_state['last_trade_time'] = time.time()
+        address_info = address_state.get(trade.address)
+        if not address_info:
+            return
+        return process_trade_with_db(
+            webhook_url,
+            trade,
+            address_info['db_path'],
+            address_info['tag'],
+            address_info['webhook'],
+        )
 
-    # Create the callback once
-    monitor_callback = create_callback(address, db_path, tag, specific_webhook_url)
-
-    while True:  # The main reconnection loop
+    while True:
         monitor = None
         monitor_thread = None
-        
-        # Reset state for the new connection attempt
         shared_state['connection_dead'].clear()
         shared_state['last_trade_time'] = time.time()
 
         try:
-            print(f"[{address_index}] Initializing monitor for address: {address}" + (f" ({tag})" if tag else ""))
-            
-            startup_grace_period[address] = time.time()
-            
+            print(f"Initializing shared monitor for {len(addresses)} addresses")
+            for index, (address, info) in enumerate(addresses.items()):
+                tag = info.get('tag')
+                print(f"[{index}] Preparing subscription for {address}" + (f" ({tag})" if tag else ""))
+                startup_grace_period[address] = time.time()
+
             monitor = HyperliquidUserFillsMonitor(
-                addresses=[address],
+                addresses=list(addresses.keys()),
                 callback=monitor_callback
             )
-            monitor_instances[address] = monitor
+            monitor_instances['shared'] = monitor
 
-            # --- Monkey-patching the send_ping method ---
             try:
                 def patched_send_ping(ws_manager_instance):
                     """Patched send_ping that signals when the websocket is closed."""
-                    print(f"[{address_index}] Starting patched ping thread for {address}.")
+                    print("Starting patched ping thread for shared websocket.")
                     while not ws_manager_instance.ws.closed and not shared_state['connection_dead'].is_set():
                         try:
                             ws_manager_instance.ws.send(json.dumps({"method": "ping"}))
                             time.sleep(5)
                         except WebSocketConnectionClosedException:
-                            print(f"[{address_index}] Ping thread: WebSocket connection closed. Signaling for reconnect.")
+                            print("Ping thread: WebSocket connection closed. Signaling for reconnect.")
                             shared_state['connection_dead'].set()
                             if monitor:
                                 monitor.stop()
                             break
                         except Exception as e:
-                            print(f"[{address_index}] Error in patched ping thread for {address}: {e}. Signaling for reconnect.")
+                            print(f"Error in patched ping thread for shared websocket: {e}. Signaling for reconnect.")
                             shared_state['connection_dead'].set()
                             if monitor:
                                 monitor.stop()
                             break
-                    print(f"[{address_index}] Patched ping thread for {address} terminated.")
+                    print("Patched ping thread for shared websocket terminated.")
 
                 if hasattr(monitor, 'info') and hasattr(monitor.info, 'ws_manager') and hasattr(monitor.info.ws_manager, 'send_ping'):
                     ws_manager = monitor.info.ws_manager
                     ws_manager.send_ping = patched_send_ping.__get__(ws_manager)
-                    print(f"[{address_index}] Successfully patched 'send_ping' method.")
+                    print("Successfully patched shared 'send_ping' method.")
                 else:
-                    sys.stderr.write(f"[{address_index}] WARNING: Could not find 'monitor.info.ws_manager.send_ping' method to patch.\n")
+                    sys.stderr.write("WARNING: Could not find 'monitor.info.ws_manager.send_ping' method to patch.\n")
             except Exception as e:
-                sys.stderr.write(f"[{address_index}] WARNING: An error occurred while applying the ping thread patch: {e}\n")
-            
+                sys.stderr.write(f"WARNING: An error occurred while applying the ping thread patch: {e}\n")
+
             error_container = {'error': None}
-            
+
             def start_monitor_thread():
                 """A thread to run the blocking monitor.start() call."""
                 try:
-                    print(f"[{address_index}] Starting monitor.start() for {address} in a new thread.")
+                    print("Starting shared monitor.start() in a new thread.")
                     monitor.start()
                 except Exception as e:
                     error_container['error'] = e
-                    sys.stderr.write(f"[{address_index}] Error inside monitor thread for {address}: {e}\n")
+                    sys.stderr.write(f"Error inside shared monitor thread: {e}\n")
                 finally:
-                    print(f"[{address_index}] Monitor thread for {address} has finished.")
+                    print("Shared monitor thread has finished.")
 
             monitor_thread = threading.Thread(target=start_monitor_thread, daemon=True)
             monitor_thread.start()
-            
+
             await asyncio.sleep(2)
             if error_container['error']:
                 raise error_container['error']
 
-            print(f"[{address_index}] Monitor for {address} started successfully. Grace period active for 60s.")
-            
-            # Main loop to check thread health and connection status
+            print(f"Shared monitor started successfully for {len(addresses)} addresses. Grace period active for 60s.")
+
             while monitor_thread.is_alive():
-                # Check 1: Signal from the ping thread
                 if shared_state['connection_dead'].is_set():
-                    print(f"[{address_index}] Main loop detected dead connection signal. Breaking to reconnect.")
+                    print("Main loop detected dead shared connection signal. Breaking to reconnect.")
                     break
-                
-                # Check 2: Inactivity timeout
+
                 if (time.time() - shared_state['last_trade_time']) > WEBSOCKET_ACTIVITY_TIMEOUT:
-                    print(f"[{address_index}] No trade activity for over {WEBSOCKET_ACTIVITY_TIMEOUT} seconds. Forcing reconnect.")
-                    shared_state['connection_dead'].set() # Signal other threads
+                    print(f"No trade activity for over {WEBSOCKET_ACTIVITY_TIMEOUT} seconds on shared websocket. Forcing reconnect.")
+                    shared_state['connection_dead'].set()
                     if monitor:
                         monitor.stop()
                     break
 
                 await asyncio.sleep(10)
-            
+
             if error_container['error']:
-                print(f"[{address_index}] Monitor thread for {address} stopped due to an error: {error_container['error']}. Reconnecting...")
+                print(f"Shared monitor thread stopped due to an error: {error_container['error']}. Reconnecting...")
             else:
-                print(f"[{address_index}] Monitor thread for {address} stopped. Reconnecting...")
+                print("Shared monitor thread stopped. Reconnecting...")
 
         except Exception as e:
-            sys.stderr.write(f"[{address_index}] An exception occurred in the monitor loop for {address}: {e}\n")
-        
+            sys.stderr.write(f"An exception occurred in the shared monitor loop: {e}\n")
+
         finally:
-            if address in monitor_instances:
+            if 'shared' in monitor_instances:
                 try:
-                    print(f"[{address_index}] Cleaning up monitor instance for {address}.")
-                    monitor_instances[address].stop()
+                    print("Cleaning up shared monitor instance.")
+                    monitor_instances['shared'].stop()
                 except Exception as e:
-                    sys.stderr.write(f"[{address_index}] Error stopping monitor during cleanup: {e}\n")
-                del monitor_instances[address]
-            
+                    sys.stderr.write(f"Error stopping shared monitor during cleanup: {e}\n")
+                del monitor_instances['shared']
+
             wait_time = 30
-            print(f"[{address_index}] Waiting {wait_time} seconds before reconnecting {address}...")
+            print(f"Waiting {wait_time} seconds before reconnecting shared websocket...")
             await asyncio.sleep(wait_time)
 
 async def run_multi_monitor_async(webhook_url: str, addresses: dict):
     """複数アドレスの非同期監視"""
     print(f"Starting multi-address monitor for {len(addresses)} addresses")
-    
-    # 各アドレスの監視タスクを作成
-    tasks = []
+
     for i, (address, info) in enumerate(addresses.items()):
-        task = asyncio.create_task(
-            monitor_address_async(webhook_url, address, info, i)
-        )
-        tasks.append(task)
-        monitor_tasks[address] = task
         tag = info.get('tag')
-        print(f"Created monitoring task for address {i}: {address}" + (f" ({tag})" if tag else ""))
-    
+        print(f"Configured address {i}: {address}" + (f" ({tag})" if tag else ""))
+
     try:
-        # すべてのタスクを並行実行
-        await asyncio.gather(*tasks)
+        await monitor_addresses_async(webhook_url, addresses)
     except Exception as e:
         print(f"Error in multi-monitor: {e}")
         raise
