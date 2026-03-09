@@ -10,6 +10,7 @@ import threading
 from websocket._exceptions import WebSocketConnectionClosedException
 from datetime import datetime, timezone
 from collections import defaultdict
+from typing import Optional
 import requests
 import json
 import sqlite3
