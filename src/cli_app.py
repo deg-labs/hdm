@@ -23,17 +23,17 @@ from .ws_monitor import HyperliquidUserFillsMonitor
 load_dotenv()
 
 # .envから各種設定を読み込む
+# Deprecated in favor of persistent notification_state transitions.
 NOTIFICATION_SUPPRESSION_SECONDS = int(os.getenv('NOTIFICATION_SUPPRESSION_SECONDS', 60))
 WEBSOCKET_ACTIVITY_TIMEOUT = int(os.getenv('WEBSOCKET_ACTIVITY_TIMEOUT', 900)) # 15分
 DB_DIRECTORY = os.getenv('DB_DIRECTORY', '.') # デフォルトはカレントディレクトリ
 HEALTHCHECK_FILE = os.getenv('HEALTHCHECK_FILE', '/tmp/healthcheck.txt')
+TRADE_RETENTION_SECONDS = int(os.getenv('TRADE_RETENTION_SECONDS', 24 * 60 * 60))
 
 # DB保存ディレクトリが存在しない場合は作成
 if DB_DIRECTORY != '.':
     os.makedirs(DB_DIRECTORY, exist_ok=True)
     print(f"Database directory set to: {DB_DIRECTORY}")
-
-last_notification_time = defaultdict(float)
 
 trade_cache = defaultdict(list)
 monitor_instances = {}
@@ -45,7 +45,7 @@ spot_meta_index_cache = None
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_REQUEST_TIMEOUT = 10
 
-processed_trades = set()
+processed_trades = {}
 startup_grace_period = {}
 
 def touch_healthcheck_file():
@@ -237,6 +237,42 @@ def make_trade_uid(trade: Trade) -> Optional[str]:
     return None
 
 
+def notification_state_key(trade: Trade) -> tuple[str, str, int, str]:
+    return (
+        trade.address,
+        trade.coin,
+        1 if trade.is_liquidation else 0,
+        trade.liquidation_kind or "",
+    )
+
+
+def prune_runtime_state(now: Optional[float] = None) -> None:
+    current_time = now if now is not None else time.time()
+    cutoff = current_time - TRADE_RETENTION_SECONDS
+
+    stale_processed = [
+        trade_key for trade_key, seen_time in processed_trades.items()
+        if seen_time < cutoff
+    ]
+    for trade_key in stale_processed:
+        processed_trades.pop(trade_key, None)
+
+    stale_trade_cache = []
+    for cache_key, trades in trade_cache.items():
+        fresh_trades = []
+        for cached_trade in trades:
+            if not cached_trade.timestamp:
+                continue
+            if cached_trade.timestamp.timestamp() >= cutoff:
+                fresh_trades.append(cached_trade)
+        if fresh_trades:
+            trade_cache[cache_key] = fresh_trades
+        else:
+            stale_trade_cache.append(cache_key)
+    for cache_key in stale_trade_cache:
+        trade_cache.pop(cache_key, None)
+
+
 def _get_trade_columns(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute("PRAGMA table_info(trades)").fetchall()
     return {row[1] for row in rows}
@@ -296,9 +332,137 @@ def _migrate_trades_table(conn: sqlite3.Connection, columns: set[str]) -> None:
     )
     conn.execute("DROP TABLE trades_legacy")
 
+
+def ensure_notification_state_table(db_path: str) -> None:
+    try:
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_state (
+                    address TEXT NOT NULL,
+                    coin TEXT NOT NULL,
+                    is_liquidation INTEGER NOT NULL DEFAULT 0,
+                    liquidation_kind TEXT NOT NULL DEFAULT '',
+                    last_direction TEXT NOT NULL,
+                    last_notified_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (address, coin, is_liquidation, liquidation_kind)
+                )
+                """
+            )
+    except sqlite3.Error as e:
+        print(f"SQLite error ensuring notification_state schema ({os.path.abspath(db_path)}): {e}")
+
+
+def get_notification_state(db_path: str, trade: Trade) -> Optional[tuple[str, int]]:
+    try:
+        ensure_notification_state_table(db_path)
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT last_direction, last_notified_at
+                FROM notification_state
+                WHERE address = ?
+                  AND coin = ?
+                  AND is_liquidation = ?
+                  AND liquidation_kind = ?
+                """,
+                notification_state_key(trade),
+            ).fetchone()
+            if row is None:
+                return None
+            return row[0], row[1]
+    except sqlite3.Error as e:
+        print(f"SQLite error reading notification_state ({os.path.abspath(db_path)}): {e}")
+        return None
+
+
+def update_notification_state(db_path: str, trade: Trade, now: int) -> None:
+    try:
+        ensure_notification_state_table(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO notification_state (
+                    address, coin, is_liquidation, liquidation_kind,
+                    last_direction, last_notified_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(address, coin, is_liquidation, liquidation_kind)
+                DO UPDATE SET
+                    last_direction = excluded.last_direction,
+                    last_notified_at = excluded.last_notified_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    *notification_state_key(trade),
+                    trade.direction,
+                    now,
+                    now,
+                ),
+            )
+    except sqlite3.Error as e:
+        print(f"SQLite error updating notification_state ({os.path.abspath(db_path)}): {e}")
+
+
+def bootstrap_notification_state(address: str, db_path: str) -> None:
+    try:
+        ensure_notification_state_table(db_path)
+        with sqlite3.connect(db_path) as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM notification_state WHERE address = ? LIMIT 1",
+                (address,),
+            ).fetchone()
+            if existing is not None:
+                return
+    except sqlite3.Error as e:
+        print(f"[{address[-8:]}] Failed to inspect notification_state: {e}")
+        return
+
+    info = Info(skip_ws=True)
+    try:
+        fills = info.user_fills(address) or []
+    except Exception as e:
+        print(f"[{address[-8:]}] Failed to bootstrap notification_state from user_fills: {e}")
+        return
+    finally:
+        try:
+            if hasattr(info, "ws_manager") and info.ws_manager:
+                info.ws_manager.stop()
+        except Exception:
+            pass
+
+    seeded_keys = set()
+    now = int(time.time())
+    for fill in fills:
+        if not isinstance(fill, dict):
+            continue
+        trade = HyperliquidUserFillsMonitor.build_trade_from_fill(fill, address)
+        if trade.direction not in {"Open Long", "Close Long", "Open Short", "Close Short"}:
+            continue
+        state_key = notification_state_key(trade)
+        if state_key in seeded_keys:
+            continue
+        update_notification_state(db_path, trade, now)
+        seeded_keys.add(state_key)
+    print(f"[{address[-8:]}] Bootstrap seeded {len(seeded_keys)} notification states.")
+
+
+def prune_trades_table(db_path: str, now: Optional[int] = None) -> None:
+    cutoff = int(now if now is not None else time.time()) - TRADE_RETENTION_SECONDS
+    try:
+        ensure_trades_table(db_path)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM trades WHERE seen_at < ?", (cutoff,))
+    except sqlite3.Error as e:
+        print(f"SQLite error pruning DB ({os.path.abspath(db_path)}): {e}")
+
 def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str, specific_webhook_url: str = None):
     """DBパスを指定してトレードを処理"""
-    global trade_cache, processed_trades, startup_grace_period, last_notification_time
+    global trade_cache, processed_trades, startup_grace_period
 
     # 通知するDirectionを限定
     allowed_directions = {"Open Long", "Close Long", "Open Short", "Close Short"}
@@ -322,38 +486,32 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     
     # 通知を抑制する（起動時の大量通知を防ぐ）
     current_time = time.time()
+    prune_runtime_state(current_time)
     address_startup_time = startup_grace_period.get(trade.address)
     
     if address_startup_time and (current_time - address_startup_time) < 60:
         print(f"[{address_suffix}] Startup grace period - skipping historical trade: {trade.tx_hash}")
-        processed_trades.add(trade_key)
+        processed_trades[trade_key] = current_time
         record_trade_in_db(db_path, trade)
         return
     
     ensure_trades_table(db_path)
+    ensure_notification_state_table(db_path)
+    prune_trades_table(db_path, int(current_time))
     if check_trade_exists_in_db(db_path, trade):
         print(f"[{address_suffix}] Trade {trade_uid} already exists in DB, skipping notification")
-        processed_trades.add(trade_key)
+        processed_trades[trade_key] = current_time
         return
 
-    # 通知抑制ロジック
-    suppression_key = (
-        trade.address,
-        trade.coin,
-        trade.direction,
-        trade.is_liquidation,
-        trade.liquidation_kind,
-    )
-    last_time = last_notification_time.get(suppression_key)
-
-    if last_time and (current_time - last_time) < NOTIFICATION_SUPPRESSION_SECONDS:
-        print(f"[{address_suffix}] Notification for {trade.coin} {trade.direction} suppressed. Last notification was at {datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S')}")
-        processed_trades.add(trade_key)
+    state = get_notification_state(db_path, trade)
+    if state and state[0] == trade.direction:
+        print(f"[{address_suffix}] Notification for {trade.coin} {trade.direction} suppressed. State already notified at {datetime.fromtimestamp(state[1]).strftime('%Y-%m-%d %H:%M:%S')}")
+        processed_trades[trade_key] = current_time
         record_trade_in_db(db_path, trade)
         return
 
     # 新しいトレードとして処理
-    processed_trades.add(trade_key)
+    processed_trades[trade_key] = current_time
     record_trade_in_db(db_path, trade)
     
     trade_cache[trade.tx_hash or trade_uid].append(trade)
@@ -369,8 +527,7 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
             print(f"[{address_suffix}] Sending Discord notification to specific webhook: {trade.tx_hash}")
             send_to_discord(specific_webhook_url, embed=embed)
 
-        # 通知を送信したら、時刻を更新
-        last_notification_time[suppression_key] = current_time
+        update_notification_state(db_path, trade, int(current_time))
 
 def ensure_trades_table(db_path: str) -> None:
     try:
@@ -438,6 +595,7 @@ def bootstrap_seen_fills(address: str, db_path: str) -> None:
     This prevents replay notifications right after down/up.
     """
     ensure_trades_table(db_path)
+    prune_trades_table(db_path)
     try:
         with sqlite3.connect(db_path) as conn:
             cur = conn.cursor()
@@ -610,7 +768,9 @@ async def monitor_address_async(webhook_url: str, address: str, info: dict, addr
     
     db_path = os.path.join(DB_DIRECTORY, f"trades_{address[-8:]}.db")
     ensure_trades_table(db_path)
+    ensure_notification_state_table(db_path)
     bootstrap_seen_fills(address, db_path)
+    bootstrap_notification_state(address, db_path)
 
     # Create a shared state object for communication between threads
     shared_state = {
