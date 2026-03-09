@@ -48,6 +48,18 @@ HYPERLIQUID_REQUEST_TIMEOUT = 10
 processed_trades = set()
 startup_grace_period = {}
 
+def make_trade_uid(trade: Trade) -> str:
+    timestamp = trade.timestamp.isoformat() if trade.timestamp else ""
+    return "|".join([
+        trade.address or "",
+        trade.tx_hash or "",
+        trade.coin or "",
+        trade.direction or "",
+        timestamp,
+        f"{trade.price}",
+        f"{trade.size}",
+    ])
+
 def touch_healthcheck_file():
     """ヘルスチェックファイルをtouch"""
     try:
@@ -231,7 +243,7 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     touch_healthcheck_file()
 
     address_suffix = trade.address[-8:]
-    trade_key = f"{trade.address}:{trade.tx_hash}"
+    trade_key = make_trade_uid(trade)
     
     # メモリベースの重複チェック
     if trade_key in processed_trades:
@@ -249,7 +261,7 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         return
     
     ensure_trades_table(db_path)
-    if check_trade_exists_in_db(db_path, trade.tx_hash):
+    if check_trade_exists_in_db(db_path, trade):
         print(f"[{address_suffix}] Trade {trade.tx_hash} already exists in DB, skipping notification")
         processed_trades.add(trade_key)
         return
@@ -268,21 +280,16 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     processed_trades.add(trade_key)
     record_trade_in_db(db_path, trade)
     
-    trade_cache[trade.tx_hash].append(trade)
-    trades = trade_cache[trade.tx_hash]
+    embed = build_trade_embed(trade, tag)
 
-    if len(trades) == 1:
-        embed = build_trade_embed(trade, tag)
-        
-        print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
-        send_to_discord(webhook_url, embed=embed)
-        
-        if specific_webhook_url:
-            print(f"[{address_suffix}] Sending Discord notification to specific webhook: {trade.tx_hash}")
-            send_to_discord(specific_webhook_url, embed=embed)
+    print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
+    send_to_discord(webhook_url, embed=embed)
 
-        # 通知を送信したら、時刻を更新
-        last_notification_time[suppression_key] = current_time
+    if specific_webhook_url:
+        print(f"[{address_suffix}] Sending Discord notification to specific webhook: {trade.tx_hash}")
+        send_to_discord(specific_webhook_url, embed=embed)
+
+    last_notification_time[suppression_key] = current_time
 
 def ensure_trades_table(db_path: str) -> None:
     try:
@@ -292,7 +299,8 @@ def ensure_trades_table(db_path: str) -> None:
         with sqlite3.connect(db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
-                    tx_hash TEXT PRIMARY KEY,
+                    trade_uid TEXT,
+                    tx_hash TEXT,
                     address TEXT NOT NULL,
                     coin TEXT,
                     direction TEXT,
@@ -300,21 +308,73 @@ def ensure_trades_table(db_path: str) -> None:
                     seen_at INTEGER NOT NULL
                 )
             """)
+
+            columns_info = list(conn.execute("PRAGMA table_info(trades)"))
+            columns = {row[1] for row in columns_info}
+            tx_hash_is_primary = any(row[1] == "tx_hash" and row[5] == 1 for row in columns_info)
+
+            if tx_hash_is_primary:
+                conn.execute("ALTER TABLE trades RENAME TO trades_legacy")
+                conn.execute("""
+                    CREATE TABLE trades (
+                        trade_uid TEXT,
+                        tx_hash TEXT,
+                        address TEXT NOT NULL,
+                        coin TEXT,
+                        direction TEXT,
+                        timestamp TEXT,
+                        seen_at INTEGER NOT NULL
+                    )
+                """)
+                conn.execute("""
+                    INSERT OR IGNORE INTO trades (trade_uid, tx_hash, address, coin, direction, timestamp, seen_at)
+                    SELECT
+                        address || '|' || COALESCE(tx_hash, '') || '|' || COALESCE(coin, '') || '|' ||
+                        COALESCE(direction, '') || '|' || COALESCE(timestamp, ''),
+                        tx_hash,
+                        address,
+                        coin,
+                        direction,
+                        timestamp,
+                        seen_at
+                    FROM trades_legacy
+                """)
+                conn.execute("DROP TABLE trades_legacy")
+                columns = {"trade_uid", "tx_hash", "address", "coin", "direction", "timestamp", "seen_at"}
+
+            if "trade_uid" not in columns:
+                conn.execute("ALTER TABLE trades ADD COLUMN trade_uid TEXT")
+
+            conn.execute("""
+                UPDATE trades
+                SET trade_uid = COALESCE(
+                    trade_uid,
+                    address || '|' || COALESCE(tx_hash, '') || '|' || COALESCE(coin, '') || '|' ||
+                    COALESCE(direction, '') || '|' || COALESCE(timestamp, '')
+                )
+                WHERE trade_uid IS NULL
+            """)
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_trade_uid
+                ON trades(trade_uid)
+            """)
     except sqlite3.Error as e:
         print(f"SQLite error ensuring DB schema ({os.path.abspath(db_path)}): {e}")
 
 def record_trade_in_db(db_path: str, trade: Trade) -> None:
     if not trade.tx_hash:
         return False
+    trade_uid = make_trade_uid(trade)
     try:
         ensure_trades_table(db_path)
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO trades (tx_hash, address, coin, direction, timestamp, seen_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO trades (trade_uid, tx_hash, address, coin, direction, timestamp, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    trade_uid,
                     trade.tx_hash,
                     trade.address,
                     trade.coin,
@@ -369,19 +429,41 @@ def bootstrap_seen_fills(address: str, db_path: str) -> None:
             seeded += 1
     print(f"[{address[-8:]}] Bootstrap seeded {seeded} fills into DB (no notifications).")
 
-def check_trade_exists_in_db(db_path: str, tx_hash: str) -> bool:
-    """DBに指定されたtx_hashのトレードが既に存在するかチェック"""
+def check_trade_exists_in_db(db_path: str, trade: Trade) -> bool:
+    """DBに指定されたfill相当のトレードが既に存在するかチェック"""
     try:
-        # DBファイルが存在しない場合は存在しないと判定
         if not os.path.exists(db_path):
             return False
         ensure_trades_table(db_path)
+        trade_uid = make_trade_uid(trade)
+        timestamp = trade.timestamp.isoformat() if trade.timestamp else None
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM trades WHERE tx_hash = ? LIMIT 1", (tx_hash,))
+            cursor.execute(
+                """
+                SELECT 1
+                FROM trades
+                WHERE trade_uid = ?
+                   OR (
+                        tx_hash = ?
+                    AND address = ?
+                    AND coin = ?
+                    AND direction = ?
+                    AND timestamp = ?
+                   )
+                LIMIT 1
+                """,
+                (
+                    trade_uid,
+                    trade.tx_hash,
+                    trade.address,
+                    trade.coin,
+                    trade.direction,
+                    timestamp,
+                ),
+            )
             row = cursor.fetchone()
             return row is not None
-        
     except sqlite3.Error as e:
         print(f"SQLite error checking trade in DB: {e}")
         return False
