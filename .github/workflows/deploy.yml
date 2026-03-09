@@ -102,7 +102,16 @@ jobs:
           workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
           service_account: ${{ env.GCP_SA_EMAIL }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure gcloud for deploy
+        run: |
+          set -euo pipefail
+          if [ -n "${{ steps.auth.outputs.project_id }}" ]; then
+            gcloud config set project "${{ steps.auth.outputs.project_id }}"
+          fi
+          gcloud config set auth/impersonate_service_account "${{ env.GCP_SA_EMAIL }}"
+          gcloud auth list --filter=status:ACTIVE --format="value(account)"
 
       # 2. Generate .env from secrets
       - name: Generate .env
@@ -119,6 +128,7 @@ jobs:
       # 3. Create artifact and Upload to GCE
       - name: Create and Upload Artifacts
         run: |
+          set -euo pipefail
           # Pack source to /tmp to avoid "file changed as we read it" error
           # Exclude .git, .env (managed separately), and data (persistent on VM)
           tar -C "$GITHUB_WORKSPACE" -czf /tmp/app.tar.gz \
@@ -129,13 +139,16 @@ jobs:
           
           # Upload .env and app.tar.gz to GCE home directory
           gcloud compute scp .env /tmp/app.tar.gz ${{ env.GCE_INSTANCE_NAME }}:~ \
-            --zone ${{ secrets.GCE_ZONE }}
+            --zone ${{ secrets.GCE_ZONE }} \
+            --impersonate-service-account "${{ env.GCP_SA_EMAIL }}"
 
       # 4. SSH to Deploy
       - name: Deploy on GCE
         run: |
+          set -euo pipefail
           gcloud compute ssh ${{ env.GCE_INSTANCE_NAME }} \
             --zone ${{ secrets.GCE_ZONE }} \
+            --impersonate-service-account "${{ env.GCP_SA_EMAIL }}" \
             --command "
               set -e
               TARGET_DIR='/opt/apps/hdm'
