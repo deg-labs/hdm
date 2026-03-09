@@ -200,6 +200,8 @@ def build_trade_embed(trade: Trade, tag: str):
     address_block_text = "\n".join(address_parts_text)
 
     display_direction = trade.direction or "Unknown"
+    if trade.is_liquidation and trade.liquidation_kind:
+        display_direction = f"{display_direction} / {trade.liquidation_kind}"
     original_format_text = f"""{address_block_text}
 Coin: {trade.coin}
 Price: {trade.price}
@@ -218,6 +220,82 @@ Ghost: https://app.hyperliquid.xyz/trade/{trade.coin}/{collateral_ticker}?hloa={
         }
     }
 
+
+def make_trade_uid(trade: Trade) -> Optional[str]:
+    if trade.fill_id:
+        return trade.fill_id
+    if trade.tx_hash:
+        return ":".join(
+            [
+                trade.tx_hash,
+                str(trade.order_id or ""),
+                trade.timestamp.isoformat() if trade.timestamp else "",
+                str(trade.price),
+                str(trade.size),
+            ]
+        )
+    return None
+
+
+def _get_trade_columns(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("PRAGMA table_info(trades)").fetchall()
+    return {row[1] for row in rows}
+
+
+def _create_trades_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trades (
+            trade_uid TEXT PRIMARY KEY,
+            tx_hash TEXT,
+            tid TEXT,
+            address TEXT NOT NULL,
+            coin TEXT,
+            direction TEXT,
+            is_liquidation INTEGER NOT NULL DEFAULT 0,
+            liquidation_kind TEXT,
+            timestamp TEXT,
+            seen_at INTEGER NOT NULL
+        )
+        """
+    )
+
+
+def _migrate_trades_table(conn: sqlite3.Connection, columns: set[str]) -> None:
+    conn.execute("ALTER TABLE trades RENAME TO trades_legacy")
+    _create_trades_table(conn)
+    trade_uid_expr = "CAST(tid AS TEXT)" if "tid" in columns else "tx_hash"
+    tx_hash_expr = "tx_hash" if "tx_hash" in columns else "NULL"
+    tid_expr = "CAST(tid AS TEXT)" if "tid" in columns else "NULL"
+    address_expr = "address" if "address" in columns else "''"
+    coin_expr = "coin" if "coin" in columns else "NULL"
+    direction_expr = "direction" if "direction" in columns else "NULL"
+    is_liquidation_expr = "COALESCE(is_liquidation, 0)" if "is_liquidation" in columns else "0"
+    liquidation_kind_expr = "liquidation_kind" if "liquidation_kind" in columns else "NULL"
+    timestamp_expr = "timestamp" if "timestamp" in columns else "NULL"
+    seen_at_expr = "seen_at" if "seen_at" in columns else "strftime('%s', 'now')"
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO trades (
+            trade_uid, tx_hash, tid, address, coin, direction,
+            is_liquidation, liquidation_kind, timestamp, seen_at
+        )
+        SELECT
+            {trade_uid_expr},
+            {tx_hash_expr},
+            {tid_expr},
+            {address_expr},
+            {coin_expr},
+            {direction_expr},
+            {is_liquidation_expr},
+            {liquidation_kind_expr},
+            {timestamp_expr},
+            {seen_at_expr}
+        FROM trades_legacy
+        """
+    )
+    conn.execute("DROP TABLE trades_legacy")
+
 def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str, specific_webhook_url: str = None):
     """DBパスを指定してトレードを処理"""
     global trade_cache, processed_trades, startup_grace_period, last_notification_time
@@ -231,7 +309,11 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     touch_healthcheck_file()
 
     address_suffix = trade.address[-8:]
-    trade_key = f"{trade.address}:{trade.tx_hash}"
+    trade_uid = make_trade_uid(trade)
+    if not trade_uid:
+        print(f"[{address_suffix}] Trade missing unique fill id, skipping notification")
+        return
+    trade_key = f"{trade.address}:{trade_uid}"
     
     # メモリベースの重複チェック
     if trade_key in processed_trades:
@@ -249,13 +331,19 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         return
     
     ensure_trades_table(db_path)
-    if check_trade_exists_in_db(db_path, trade.tx_hash):
-        print(f"[{address_suffix}] Trade {trade.tx_hash} already exists in DB, skipping notification")
+    if check_trade_exists_in_db(db_path, trade):
+        print(f"[{address_suffix}] Trade {trade_uid} already exists in DB, skipping notification")
         processed_trades.add(trade_key)
         return
 
     # 通知抑制ロジック
-    suppression_key = (trade.address, trade.coin, trade.direction)
+    suppression_key = (
+        trade.address,
+        trade.coin,
+        trade.direction,
+        trade.is_liquidation,
+        trade.liquidation_kind,
+    )
     last_time = last_notification_time.get(suppression_key)
 
     if last_time and (current_time - last_time) < NOTIFICATION_SUPPRESSION_SECONDS:
@@ -268,8 +356,8 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     processed_trades.add(trade_key)
     record_trade_in_db(db_path, trade)
     
-    trade_cache[trade.tx_hash].append(trade)
-    trades = trade_cache[trade.tx_hash]
+    trade_cache[trade.tx_hash or trade_uid].append(trade)
+    trades = trade_cache[trade.tx_hash or trade_uid]
 
     if len(trades) == 1:
         embed = build_trade_embed(trade, tag)
@@ -290,35 +378,51 @@ def ensure_trades_table(db_path: str) -> None:
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
         with sqlite3.connect(db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    tx_hash TEXT PRIMARY KEY,
-                    address TEXT NOT NULL,
-                    coin TEXT,
-                    direction TEXT,
-                    timestamp TEXT,
-                    seen_at INTEGER NOT NULL
-                )
-            """)
+            columns = _get_trade_columns(conn)
+            if not columns:
+                _create_trades_table(conn)
+            else:
+                required_columns = {
+                    "trade_uid",
+                    "tx_hash",
+                    "tid",
+                    "address",
+                    "coin",
+                    "direction",
+                    "is_liquidation",
+                    "liquidation_kind",
+                    "timestamp",
+                    "seen_at",
+                }
+                if not required_columns.issubset(columns):
+                    _migrate_trades_table(conn, columns)
     except sqlite3.Error as e:
         print(f"SQLite error ensuring DB schema ({os.path.abspath(db_path)}): {e}")
 
 def record_trade_in_db(db_path: str, trade: Trade) -> None:
-    if not trade.tx_hash:
+    trade_uid = make_trade_uid(trade)
+    if not trade_uid:
         return False
     try:
         ensure_trades_table(db_path)
         with sqlite3.connect(db_path) as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO trades (tx_hash, address, coin, direction, timestamp, seen_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO trades (
+                    trade_uid, tx_hash, tid, address, coin, direction,
+                    is_liquidation, liquidation_kind, timestamp, seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    trade_uid,
                     trade.tx_hash,
+                    trade.fill_id,
                     trade.address,
                     trade.coin,
                     trade.direction,
+                    1 if trade.is_liquidation else 0,
+                    trade.liquidation_kind,
                     trade.timestamp.isoformat() if trade.timestamp else None,
                     int(time.time()),
                 ),
@@ -369,16 +473,18 @@ def bootstrap_seen_fills(address: str, db_path: str) -> None:
             seeded += 1
     print(f"[{address[-8:]}] Bootstrap seeded {seeded} fills into DB (no notifications).")
 
-def check_trade_exists_in_db(db_path: str, tx_hash: str) -> bool:
-    """DBに指定されたtx_hashのトレードが既に存在するかチェック"""
+def check_trade_exists_in_db(db_path: str, trade: Trade) -> bool:
+    """DBに指定されたfill相当のトレードが既に存在するかチェック"""
     try:
-        # DBファイルが存在しない場合は存在しないと判定
         if not os.path.exists(db_path):
             return False
         ensure_trades_table(db_path)
+        trade_uid = make_trade_uid(trade)
+        if not trade_uid:
+            return False
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM trades WHERE tx_hash = ? LIMIT 1", (tx_hash,))
+            cursor.execute("SELECT 1 FROM trades WHERE trade_uid = ? LIMIT 1", (trade_uid,))
             row = cursor.fetchone()
             return row is not None
         
