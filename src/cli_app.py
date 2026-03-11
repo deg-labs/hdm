@@ -212,6 +212,8 @@ def build_trade_embed(trade: Trade, tag: str):
     address_block_text = "\n".join(address_parts_text)
 
     display_direction = trade.direction or "Unknown"
+    if trade.is_liquidation and trade.liquidation_kind:
+        display_direction = f"{display_direction} / {trade.liquidation_kind}"
     original_format_text = f"""{address_block_text}
 Coin: {trade.coin}
 Price: {trade.price}
@@ -267,7 +269,13 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         return
 
     # 通知抑制ロジック
-    suppression_key = (trade.address, trade.coin, trade.direction)
+    suppression_key = (
+        trade.address,
+        trade.coin,
+        trade.direction,
+        trade.is_liquidation,
+        trade.liquidation_kind,
+    )
     last_time = last_notification_time.get(suppression_key)
 
     if last_time and (current_time - last_time) < NOTIFICATION_SUPPRESSION_SECONDS:
