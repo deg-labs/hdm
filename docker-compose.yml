@@ -2,7 +2,6 @@ services:
   hdm:
     build: .
     restart: always
-    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
       - TZ=Asia/Tokyo
     env_file:
