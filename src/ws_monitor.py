@@ -1,4 +1,5 @@
 import threading
+import logging
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
@@ -6,6 +7,9 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
 from .models import Trade
+
+
+logger = logging.getLogger("hdm.ws")
 
 
 class HyperliquidUserFillsMonitor:
@@ -63,10 +67,12 @@ class HyperliquidUserFillsMonitor:
         fills = data.get("fills") or []
         for fill in fills:
             if not isinstance(fill, dict):
+                logger.debug("ignoring non-dict fill address=%s fill_type=%s", address, type(fill).__name__)
                 continue
             try:
                 trade = self.build_trade_from_fill(fill, address)
-            except Exception:
+            except Exception as e:
+                logger.warning("failed to parse fill address=%s error=%s fill=%s", address, e, fill)
                 continue
             if self.callback:
                 self.callback(trade)
@@ -86,5 +92,6 @@ class HyperliquidUserFillsMonitor:
         try:
             if self.info and self.info.ws_manager:
                 self.info.ws_manager.stop()
-        except Exception:
+        except Exception as e:
+            logger.debug("error stopping websocket manager error=%s", e)
             pass

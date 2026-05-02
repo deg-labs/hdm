@@ -1,4 +1,8 @@
 import sys
+import logging
+
+
+logger = logging.getLogger("hdm.addresses")
 
 
 def load_addresses(file_path: str) -> dict:
@@ -18,11 +22,11 @@ def load_addresses(file_path: str) -> dict:
                     webhook = parts[2] if len(parts) > 2 and parts[2] else None
                     addresses[address] = {"tag": tag, "webhook": webhook}
     except IOError as e:
-        sys.stderr.write(f"Error reading addresses file: {e}\n")
+        logger.error("error reading addresses file path=%s error=%s", file_path, e)
         sys.exit(1)
 
     if not addresses:
-        sys.stderr.write("No addresses found in addresses file\n")
+        logger.error("no addresses found in addresses file path=%s", file_path)
         sys.exit(1)
 
     return addresses
