@@ -35,7 +35,7 @@ class HyperliquidUserFillsMonitor:
             timestamp=timestamp,
             address=address,
             coin=fill.get("coin", "Unknown"),
-            side="BUY" if fill.get("side", "B") == "A" else "SELL",
+            side="SELL" if fill.get("side") == "A" else "BUY",
             size=size,
             price=float(fill.get("px", 0)),
             trade_type="FILL",
