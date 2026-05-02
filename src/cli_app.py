@@ -7,7 +7,6 @@ import argparse
 import subprocess
 import asyncio
 import threading
-from websocket._exceptions import WebSocketConnectionClosedException
 from datetime import datetime, timezone
 from collections import defaultdict
 import requests
@@ -41,6 +40,7 @@ main_loop = None
 monitor_tasks = {}
 collateral_ticker_cache = {}
 spot_meta_index_cache = None
+shutdown_requested = threading.Event()
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_REQUEST_TIMEOUT = 10
@@ -560,9 +560,9 @@ def run_test_preview(
     done_event.wait(timeout_seconds)
     if hasattr(info, "ws_manager") and info.ws_manager:
         try:
-            info.ws_manager.ws.close()
+            info.ws_manager.stop()
         except Exception as e:
-            print(f"Error closing websocket: {e}")
+            print(f"Error stopping websocket: {e}")
 
     with count_lock:
         printed = count
@@ -618,7 +618,7 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
             address_info['webhook'],
         )
 
-    while True:
+    while not shutdown_requested.is_set():
         monitor = None
         monitor_thread = None
         shared_state['connection_dead'].clear()
@@ -638,35 +638,30 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
             monitor_instances['shared'] = monitor
 
             try:
-                def patched_send_ping(ws_manager_instance):
-                    """Patched send_ping that signals when the websocket is closed."""
-                    print("Starting patched ping thread for shared websocket.")
-                    while not ws_manager_instance.ws.closed and not shared_state['connection_dead'].is_set():
-                        try:
-                            ws_manager_instance.ws.send(json.dumps({"method": "ping"}))
-                            time.sleep(5)
-                        except WebSocketConnectionClosedException:
-                            print("Ping thread: WebSocket connection closed. Signaling for reconnect.")
-                            shared_state['connection_dead'].set()
-                            if monitor:
-                                monitor.stop()
-                            break
-                        except Exception as e:
-                            print(f"Error in patched ping thread for shared websocket: {e}. Signaling for reconnect.")
-                            shared_state['connection_dead'].set()
-                            if monitor:
-                                monitor.stop()
-                            break
-                    print("Patched ping thread for shared websocket terminated.")
-
-                if hasattr(monitor, 'info') and hasattr(monitor.info, 'ws_manager') and hasattr(monitor.info.ws_manager, 'send_ping'):
+                if hasattr(monitor, 'info') and hasattr(monitor.info, 'ws_manager') and monitor.info.ws_manager:
                     ws_manager = monitor.info.ws_manager
-                    ws_manager.send_ping = patched_send_ping.__get__(ws_manager)
-                    print("Successfully patched shared 'send_ping' method.")
+                    original_on_close = ws_manager.ws.on_close
+                    original_on_error = ws_manager.ws.on_error
+
+                    def on_ws_close(ws, close_status_code, close_msg):
+                        print(f"Shared websocket closed: code={close_status_code}, message={close_msg}")
+                        shared_state['connection_dead'].set()
+                        if original_on_close:
+                            original_on_close(ws, close_status_code, close_msg)
+
+                    def on_ws_error(ws, error):
+                        print(f"Shared websocket error: {error}. Signaling for reconnect.")
+                        shared_state['connection_dead'].set()
+                        if original_on_error:
+                            original_on_error(ws, error)
+
+                    ws_manager.ws.on_close = on_ws_close
+                    ws_manager.ws.on_error = on_ws_error
+                    print("Successfully installed shared websocket close/error handlers.")
                 else:
-                    sys.stderr.write("WARNING: Could not find 'monitor.info.ws_manager.send_ping' method to patch.\n")
+                    sys.stderr.write("WARNING: Could not find shared websocket manager for close/error handlers.\n")
             except Exception as e:
-                sys.stderr.write(f"WARNING: An error occurred while applying the ping thread patch: {e}\n")
+                sys.stderr.write(f"WARNING: An error occurred while installing websocket close/error handlers: {e}\n")
 
             error_container = {'error': None}
 
@@ -690,9 +685,11 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
 
             print(f"Shared monitor started successfully for {len(addresses)} addresses. Grace period active for 60s.")
 
-            while monitor_thread.is_alive():
+            while monitor_thread.is_alive() and not shutdown_requested.is_set():
                 if shared_state['connection_dead'].is_set():
                     print("Main loop detected dead shared connection signal. Breaking to reconnect.")
+                    if monitor:
+                        monitor.stop()
                     break
 
                 if (time.time() - shared_state['last_trade_time']) > WEBSOCKET_ACTIVITY_TIMEOUT:
@@ -704,7 +701,9 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
 
                 await asyncio.sleep(10)
 
-            if error_container['error']:
+            if shutdown_requested.is_set():
+                print("Shutdown requested. Shared monitor loop is stopping.")
+            elif error_container['error']:
                 print(f"Shared monitor thread stopped due to an error: {error_container['error']}. Reconnecting...")
             else:
                 print("Shared monitor thread stopped. Reconnecting...")
@@ -721,9 +720,12 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
                     sys.stderr.write(f"Error stopping shared monitor during cleanup: {e}\n")
                 del monitor_instances['shared']
 
-            wait_time = 30
-            print(f"Waiting {wait_time} seconds before reconnecting shared websocket...")
-            await asyncio.sleep(wait_time)
+            if shutdown_requested.is_set():
+                print("Shutdown requested. Skipping reconnect wait.")
+            else:
+                wait_time = 30
+                print(f"Waiting {wait_time} seconds before reconnecting shared websocket...")
+                await asyncio.sleep(wait_time)
 
 async def run_multi_monitor_async(webhook_url: str, addresses: dict):
     """複数アドレスの非同期監視"""
@@ -741,6 +743,7 @@ async def run_multi_monitor_async(webhook_url: str, addresses: dict):
 
 def signal_handler(signum, frame):
     global monitor_instances, main_loop
+    shutdown_requested.set()
     print(f"Received signal {signum}, shutting down...")
 
     # すべての監視インスタンスを停止
@@ -809,6 +812,7 @@ def start_daemon(script_path, addresses_file):
 def run_monitor(webhook_url: str, addresses_file: str, background_mode: bool = False):
     """メイン監視ループ（複数アドレス対応）"""
     global main_loop
+    shutdown_requested.clear()
     
     addresses = load_addresses(addresses_file)
     
