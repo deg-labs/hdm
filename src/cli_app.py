@@ -439,6 +439,11 @@ def bootstrap_seen_fills(address: str, db_path: str) -> None:
                 info.ws_manager.stop()
         except Exception:
             pass
+        try:
+            if hasattr(info, "session"):
+                info.session.close()
+        except Exception:
+            pass
 
     seeded = 0
     for fill in fills:
@@ -578,6 +583,11 @@ def run_test_preview(
             info.ws_manager.stop()
         except Exception as e:
             logger.warning("error stopping preview websocket error=%s", e)
+    if hasattr(info, "session"):
+        try:
+            info.session.close()
+        except Exception as e:
+            logger.warning("error closing preview session error=%s", e)
 
     with count_lock:
         printed = count

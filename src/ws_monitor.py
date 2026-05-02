@@ -94,4 +94,8 @@ class HyperliquidUserFillsMonitor:
                 self.info.ws_manager.stop()
         except Exception as e:
             logger.debug("error stopping websocket manager error=%s", e)
-            pass
+        try:
+            if self.info and hasattr(self.info, "session"):
+                self.info.session.close()
+        except Exception as e:
+            logger.debug("error closing info session error=%s", e)
