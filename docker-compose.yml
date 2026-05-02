@@ -2,6 +2,10 @@ services:
   hdm:
     build: .
     restart: always
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     environment:
       - TZ=Asia/Tokyo
     env_file:

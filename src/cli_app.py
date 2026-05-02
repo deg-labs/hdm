@@ -7,7 +7,7 @@ import argparse
 import subprocess
 import asyncio
 import threading
-from websocket._exceptions import WebSocketConnectionClosedException
+import logging
 from datetime import datetime, timezone
 from collections import defaultdict
 import requests
@@ -22,6 +22,14 @@ from .ws_monitor import HyperliquidUserFillsMonitor
 
 load_dotenv()
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-8s %(name)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("hdm")
+
 # .envから各種設定を読み込む
 NOTIFICATION_SUPPRESSION_SECONDS = int(os.getenv('NOTIFICATION_SUPPRESSION_SECONDS', 60))
 WEBSOCKET_ACTIVITY_TIMEOUT = int(os.getenv('WEBSOCKET_ACTIVITY_TIMEOUT', 900)) # 15分
@@ -31,7 +39,7 @@ HEALTHCHECK_FILE = os.getenv('HEALTHCHECK_FILE', '/tmp/healthcheck.txt')
 # DB保存ディレクトリが存在しない場合は作成
 if DB_DIRECTORY != '.':
     os.makedirs(DB_DIRECTORY, exist_ok=True)
-    print(f"Database directory set to: {DB_DIRECTORY}")
+    logger.debug("database directory set path=%s", DB_DIRECTORY)
 
 last_notification_time = defaultdict(float)
 
@@ -41,6 +49,7 @@ main_loop = None
 monitor_tasks = {}
 collateral_ticker_cache = {}
 spot_meta_index_cache = None
+shutdown_requested = threading.Event()
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_REQUEST_TIMEOUT = 10
@@ -66,7 +75,7 @@ def touch_healthcheck_file():
         with open(HEALTHCHECK_FILE, 'a'):
             os.utime(HEALTHCHECK_FILE, None)
     except Exception as e:
-        sys.stderr.write(f"Failed to touch healthcheck file: {e}\n")
+        logger.warning("failed to touch healthcheck file path=%s error=%s", HEALTHCHECK_FILE, e)
 
 def send_to_discord(webhook_url: str, message: str = None, embed: dict = None):
     payload = {
@@ -93,7 +102,7 @@ def send_to_discord(webhook_url: str, message: str = None, embed: dict = None):
             return
         except requests.exceptions.RequestException as e:
             if attempt == max_attempts:
-                sys.stderr.write(f"Failed to send message to Discord after {max_attempts} attempts: {e}\n")
+                logger.error("discord send failed attempts=%s error=%s", max_attempts, e)
                 return
             time.sleep(2 ** (attempt - 1))
 
@@ -112,7 +121,7 @@ def fetch_spot_meta_index_map():
         response.raise_for_status()
         payload = response.json()
     except requests.exceptions.RequestException as e:
-        sys.stderr.write(f"Failed to fetch spotMeta: {e}\n")
+        logger.warning("failed to fetch spotMeta error=%s", e)
         spot_meta_index_cache = {}
         return spot_meta_index_cache
 
@@ -136,7 +145,7 @@ def fetch_collateral_token_index(dex: str):
         response.raise_for_status()
         payload = response.json()
     except requests.exceptions.RequestException as e:
-        sys.stderr.write(f"Failed to fetch metaAndAssetCtxs for dex {dex}: {e}\n")
+        logger.warning("failed to fetch metaAndAssetCtxs dex=%s error=%s", dex, e)
         return None
 
     if not payload or not isinstance(payload, list):
@@ -249,7 +258,7 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     
     # メモリベースの重複チェック
     if trade_key in processed_trades:
-        print(f"[{address_suffix}] Trade {trade.tx_hash} already processed in memory, skipping")
+        logger.debug("trade skipped reason=memory_duplicate address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
         return
     
     # 通知を抑制する（起動時の大量通知を防ぐ）
@@ -257,14 +266,14 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     address_startup_time = startup_grace_period.get(trade.address)
     
     if address_startup_time and (current_time - address_startup_time) < 60:
-        print(f"[{address_suffix}] Startup grace period - skipping historical trade: {trade.tx_hash}")
+        logger.debug("trade skipped reason=startup_grace address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
         processed_trades.add(trade_key)
         record_trade_in_db(db_path, trade)
         return
     
     ensure_trades_table(db_path)
     if check_trade_exists_in_db(db_path, trade):
-        print(f"[{address_suffix}] Trade {trade.tx_hash} already exists in DB, skipping notification")
+        logger.debug("trade skipped reason=db_duplicate address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
         processed_trades.add(trade_key)
         return
 
@@ -279,7 +288,13 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     last_time = last_notification_time.get(suppression_key)
 
     if last_time and (current_time - last_time) < NOTIFICATION_SUPPRESSION_SECONDS:
-        print(f"[{address_suffix}] Notification for {trade.coin} {trade.direction} suppressed. Last notification was at {datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(
+            "notification suppressed address_suffix=%s coin=%s direction=%s last_notification=%s",
+            address_suffix,
+            trade.coin,
+            trade.direction,
+            datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S'),
+        )
         processed_trades.add(trade_key)
         record_trade_in_db(db_path, trade)
         return
@@ -290,11 +305,11 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     
     embed = build_trade_embed(trade, tag)
 
-    print(f"[{address_suffix}] Sending Discord notification for new trade: {trade.tx_hash}")
+    logger.info("sending discord notification address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
     send_to_discord(webhook_url, embed=embed)
 
     if specific_webhook_url:
-        print(f"[{address_suffix}] Sending Discord notification to specific webhook: {trade.tx_hash}")
+        logger.info("sending specific discord notification address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
         send_to_discord(specific_webhook_url, embed=embed)
 
     last_notification_time[suppression_key] = current_time
@@ -367,7 +382,7 @@ def ensure_trades_table(db_path: str) -> None:
                 ON trades(trade_uid)
             """)
     except sqlite3.Error as e:
-        print(f"SQLite error ensuring DB schema ({os.path.abspath(db_path)}): {e}")
+        logger.error("sqlite schema setup failed db=%s error=%s", os.path.abspath(db_path), e)
 
 def record_trade_in_db(db_path: str, trade: Trade) -> None:
     if not trade.tx_hash:
@@ -393,7 +408,7 @@ def record_trade_in_db(db_path: str, trade: Trade) -> None:
             )
         return True
     except sqlite3.Error as e:
-        print(f"SQLite error storing trade in DB ({os.path.abspath(db_path)}): {e}")
+        logger.error("sqlite store trade failed db=%s error=%s", os.path.abspath(db_path), e)
         return False
 
 def bootstrap_seen_fills(address: str, db_path: str) -> None:
@@ -409,19 +424,24 @@ def bootstrap_seen_fills(address: str, db_path: str) -> None:
             if cur.fetchone()[0] > 0:
                 return
     except sqlite3.Error as e:
-        print(f"[{address[-8:]}] Failed to inspect DB for bootstrap: {e}")
+        logger.warning("bootstrap db inspect failed address_suffix=%s error=%s", address[-8:], e)
         return
 
     info = Info(skip_ws=True)
     try:
         fills = info.user_fills(address) or []
     except Exception as e:
-        print(f"[{address[-8:]}] Failed to bootstrap user_fills: {e}")
+        logger.warning("bootstrap user_fills failed address_suffix=%s error=%s", address[-8:], e)
         return
     finally:
         try:
             if hasattr(info, "ws_manager") and info.ws_manager:
                 info.ws_manager.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(info, "session"):
+                info.session.close()
         except Exception:
             pass
 
@@ -435,7 +455,7 @@ def bootstrap_seen_fills(address: str, db_path: str) -> None:
         trade = HyperliquidUserFillsMonitor.build_trade_from_fill(fill, address)
         if record_trade_in_db(db_path, trade):
             seeded += 1
-    print(f"[{address[-8:]}] Bootstrap seeded {seeded} fills into DB (no notifications).")
+    logger.info("bootstrap seeded fills address_suffix=%s count=%s", address[-8:], seeded)
 
 def check_trade_exists_in_db(db_path: str, trade: Trade) -> bool:
     """DBに指定されたfill相当のトレードが既に存在するかチェック"""
@@ -473,10 +493,10 @@ def check_trade_exists_in_db(db_path: str, trade: Trade) -> bool:
             row = cursor.fetchone()
             return row is not None
     except sqlite3.Error as e:
-        print(f"SQLite error checking trade in DB: {e}")
+        logger.error("sqlite check trade failed error=%s", e)
         return False
     except Exception as e:
-        print(f"Error checking trade in DB: {e}")
+        logger.error("check trade failed error=%s", e)
         return False
 
 def run_test_preview(
@@ -486,7 +506,7 @@ def run_test_preview(
     max_entries: int = None
 ):
     if not os.path.exists(addresses_file):
-        print(f"Addresses file not found: {addresses_file}")
+        logger.error("addresses file not found path=%s", addresses_file)
         return
 
     addresses = load_addresses(addresses_file)
@@ -499,10 +519,10 @@ def run_test_preview(
     count_lock = threading.Lock()
     done_event = threading.Event()
 
-    print(f"Starting websocket preview for {len(addresses)} addresses (timeout: {timeout_seconds}s)")
+    logger.info("starting websocket preview addresses=%s timeout_seconds=%s", len(addresses), timeout_seconds)
     if enable_posting:
-        print("WARNING: Discord posting is ENABLED for this test.")
-    print(f"Printing up to {max_entries} fills")
+        logger.warning("discord posting is enabled for preview")
+    logger.info("preview max entries=%s", max_entries)
 
     def callback(msg):
         nonlocal count
@@ -543,10 +563,10 @@ def run_test_preview(
             if enable_posting:
                 webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
                 if webhook_url:
-                    print("Sending to global webhook...")
+                    logger.info("preview sending to global webhook")
                     send_to_discord(webhook_url, embed=embed)
                 if specific_webhook:
-                    print("Sending to specific webhook...")
+                    logger.info("preview sending to specific webhook")
                     send_to_discord(specific_webhook, embed=embed)
 
             if count >= max_entries or not pending:
@@ -560,30 +580,35 @@ def run_test_preview(
     done_event.wait(timeout_seconds)
     if hasattr(info, "ws_manager") and info.ws_manager:
         try:
-            info.ws_manager.ws.close()
+            info.ws_manager.stop()
         except Exception as e:
-            print(f"Error closing websocket: {e}")
+            logger.warning("error stopping preview websocket error=%s", e)
+    if hasattr(info, "session"):
+        try:
+            info.session.close()
+        except Exception as e:
+            logger.warning("error closing preview session error=%s", e)
 
     with count_lock:
         printed = count
     if printed < max_entries:
-        print(f"\nTimeout reached. Printed {printed}/{max_entries} fills.")
+        logger.info("preview timeout reached printed=%s max_entries=%s", printed, max_entries)
 
 def write_pidfile(pidfile):
     try:
         with open(pidfile, 'w') as f:
             f.write(str(os.getpid()))
-        print(f"PID file created: {pidfile}")
+        logger.info("pid file created path=%s", pidfile)
     except IOError as e:
-        sys.stderr.write(f"Failed to write pidfile: {e}\n")
+        logger.error("failed to write pidfile path=%s error=%s", pidfile, e)
 
 def remove_pidfile(pidfile):
     try:
         if os.path.exists(pidfile):
             os.remove(pidfile)
-            print(f"PID file removed: {pidfile}")
+            logger.info("pid file removed path=%s", pidfile)
     except OSError as e:
-        print(f"Error removing pidfile: {e}")
+        logger.warning("error removing pidfile path=%s error=%s", pidfile, e)
 
 async def monitor_addresses_async(webhook_url: str, addresses: dict):
     """複数アドレスを単一 WebSocket 接続で監視し、切断時に自動再接続する"""
@@ -618,17 +643,17 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
             address_info['webhook'],
         )
 
-    while True:
+    while not shutdown_requested.is_set():
         monitor = None
         monitor_thread = None
         shared_state['connection_dead'].clear()
         shared_state['last_trade_time'] = time.time()
 
         try:
-            print(f"Initializing shared monitor for {len(addresses)} addresses")
+            logger.info("initializing shared monitor addresses=%s", len(addresses))
             for index, (address, info) in enumerate(addresses.items()):
                 tag = info.get('tag')
-                print(f"[{index}] Preparing subscription for {address}" + (f" ({tag})" if tag else ""))
+                logger.info("preparing subscription index=%s address=%s tag=%s", index, address, tag or "")
                 startup_grace_period[address] = time.time()
 
             monitor = HyperliquidUserFillsMonitor(
@@ -638,48 +663,43 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
             monitor_instances['shared'] = monitor
 
             try:
-                def patched_send_ping(ws_manager_instance):
-                    """Patched send_ping that signals when the websocket is closed."""
-                    print("Starting patched ping thread for shared websocket.")
-                    while not ws_manager_instance.ws.closed and not shared_state['connection_dead'].is_set():
-                        try:
-                            ws_manager_instance.ws.send(json.dumps({"method": "ping"}))
-                            time.sleep(5)
-                        except WebSocketConnectionClosedException:
-                            print("Ping thread: WebSocket connection closed. Signaling for reconnect.")
-                            shared_state['connection_dead'].set()
-                            if monitor:
-                                monitor.stop()
-                            break
-                        except Exception as e:
-                            print(f"Error in patched ping thread for shared websocket: {e}. Signaling for reconnect.")
-                            shared_state['connection_dead'].set()
-                            if monitor:
-                                monitor.stop()
-                            break
-                    print("Patched ping thread for shared websocket terminated.")
-
-                if hasattr(monitor, 'info') and hasattr(monitor.info, 'ws_manager') and hasattr(monitor.info.ws_manager, 'send_ping'):
+                if hasattr(monitor, 'info') and hasattr(monitor.info, 'ws_manager') and monitor.info.ws_manager:
                     ws_manager = monitor.info.ws_manager
-                    ws_manager.send_ping = patched_send_ping.__get__(ws_manager)
-                    print("Successfully patched shared 'send_ping' method.")
+                    original_on_close = ws_manager.ws.on_close
+                    original_on_error = ws_manager.ws.on_error
+
+                    def on_ws_close(ws, close_status_code, close_msg):
+                        logger.warning("shared websocket closed code=%s message=%s", close_status_code, close_msg)
+                        shared_state['connection_dead'].set()
+                        if original_on_close:
+                            original_on_close(ws, close_status_code, close_msg)
+
+                    def on_ws_error(ws, error):
+                        logger.warning("shared websocket error error=%s", error)
+                        shared_state['connection_dead'].set()
+                        if original_on_error:
+                            original_on_error(ws, error)
+
+                    ws_manager.ws.on_close = on_ws_close
+                    ws_manager.ws.on_error = on_ws_error
+                    logger.info("installed shared websocket close/error handlers")
                 else:
-                    sys.stderr.write("WARNING: Could not find 'monitor.info.ws_manager.send_ping' method to patch.\n")
+                    logger.warning("could not find shared websocket manager for close/error handlers")
             except Exception as e:
-                sys.stderr.write(f"WARNING: An error occurred while applying the ping thread patch: {e}\n")
+                logger.warning("failed to install websocket close/error handlers error=%s", e)
 
             error_container = {'error': None}
 
             def start_monitor_thread():
                 """A thread to run the blocking monitor.start() call."""
                 try:
-                    print("Starting shared monitor.start() in a new thread.")
+                    logger.info("starting shared monitor thread")
                     monitor.start()
                 except Exception as e:
                     error_container['error'] = e
-                    sys.stderr.write(f"Error inside shared monitor thread: {e}\n")
+                    logger.error("shared monitor thread failed error=%s", e)
                 finally:
-                    print("Shared monitor thread has finished.")
+                    logger.info("shared monitor thread finished")
 
             monitor_thread = threading.Thread(target=start_monitor_thread, daemon=True)
             monitor_thread.start()
@@ -688,15 +708,17 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
             if error_container['error']:
                 raise error_container['error']
 
-            print(f"Shared monitor started successfully for {len(addresses)} addresses. Grace period active for 60s.")
+            logger.info("shared monitor started addresses=%s startup_grace_seconds=60", len(addresses))
 
-            while monitor_thread.is_alive():
+            while monitor_thread.is_alive() and not shutdown_requested.is_set():
                 if shared_state['connection_dead'].is_set():
-                    print("Main loop detected dead shared connection signal. Breaking to reconnect.")
+                    logger.warning("dead shared websocket detected; reconnecting")
+                    if monitor:
+                        monitor.stop()
                     break
 
                 if (time.time() - shared_state['last_trade_time']) > WEBSOCKET_ACTIVITY_TIMEOUT:
-                    print(f"No trade activity for over {WEBSOCKET_ACTIVITY_TIMEOUT} seconds on shared websocket. Forcing reconnect.")
+                    logger.warning("websocket activity timeout seconds=%s; reconnecting", WEBSOCKET_ACTIVITY_TIMEOUT)
                     shared_state['connection_dead'].set()
                     if monitor:
                         monitor.stop()
@@ -704,52 +726,58 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
 
                 await asyncio.sleep(10)
 
-            if error_container['error']:
-                print(f"Shared monitor thread stopped due to an error: {error_container['error']}. Reconnecting...")
+            if shutdown_requested.is_set():
+                logger.info("shutdown requested; shared monitor loop stopping")
+            elif error_container['error']:
+                logger.warning("shared monitor stopped with error; reconnecting error=%s", error_container['error'])
             else:
-                print("Shared monitor thread stopped. Reconnecting...")
+                logger.warning("shared monitor stopped; reconnecting")
 
         except Exception as e:
-            sys.stderr.write(f"An exception occurred in the shared monitor loop: {e}\n")
+            logger.exception("shared monitor loop failed error=%s", e)
 
         finally:
             if 'shared' in monitor_instances:
                 try:
-                    print("Cleaning up shared monitor instance.")
+                    logger.info("cleaning up shared monitor instance")
                     monitor_instances['shared'].stop()
                 except Exception as e:
-                    sys.stderr.write(f"Error stopping shared monitor during cleanup: {e}\n")
+                    logger.warning("error stopping shared monitor during cleanup error=%s", e)
                 del monitor_instances['shared']
 
-            wait_time = 30
-            print(f"Waiting {wait_time} seconds before reconnecting shared websocket...")
-            await asyncio.sleep(wait_time)
+            if shutdown_requested.is_set():
+                logger.info("shutdown requested; skipping reconnect wait")
+            else:
+                wait_time = 30
+                logger.info("waiting before reconnect seconds=%s", wait_time)
+                await asyncio.sleep(wait_time)
 
 async def run_multi_monitor_async(webhook_url: str, addresses: dict):
     """複数アドレスの非同期監視"""
-    print(f"Starting multi-address monitor for {len(addresses)} addresses")
+    logger.info("starting multi-address monitor addresses=%s", len(addresses))
 
     for i, (address, info) in enumerate(addresses.items()):
         tag = info.get('tag')
-        print(f"Configured address {i}: {address}" + (f" ({tag})" if tag else ""))
+        logger.info("configured address index=%s address=%s tag=%s", i, address, tag or "")
 
     try:
         await monitor_addresses_async(webhook_url, addresses)
     except Exception as e:
-        print(f"Error in multi-monitor: {e}")
+        logger.exception("multi-monitor failed error=%s", e)
         raise
 
 def signal_handler(signum, frame):
     global monitor_instances, main_loop
-    print(f"Received signal {signum}, shutting down...")
+    shutdown_requested.set()
+    logger.info("received signal; shutting down signal=%s", signum)
 
     # すべての監視インスタンスを停止
     for address, monitor in monitor_instances.items():
         try:
-            print(f"Stopping monitor for {address}")
+            logger.info("stopping monitor key=%s", address)
             monitor.stop()
         except Exception as e:
-            print(f"Error stopping monitor for {address}: {e}")
+            logger.warning("error stopping monitor key=%s error=%s", address, e)
     
     monitor_instances.clear()
     
@@ -768,9 +796,9 @@ def start_daemon(script_path, addresses_file):
     
     cmd = [sys.executable, script_path, 'monitor', addresses_file, '--background']
     
-    print(f"Starting multi-address daemon with command: {' '.join(cmd)}")
-    print(f"Logs will be written to: {log_file}")
-    print(f"Errors will be written to: {error_file}")
+    logger.info("starting daemon command=%s", " ".join(cmd))
+    logger.info("daemon log file path=%s", log_file)
+    logger.info("daemon error log file path=%s", error_file)
     
     try:
         with open(log_file, 'a') as log_f, open(error_file, 'a') as err_f:
@@ -786,42 +814,41 @@ def start_daemon(script_path, addresses_file):
             with open(pidfile, 'w') as f:
                 f.write(str(process.pid))
             
-            print(f"Multi-address daemon started with PID: {process.pid}")
-            print(f"PID file: {pidfile}")
+            logger.info("daemon process started pid=%s pidfile=%s", process.pid, pidfile)
             
             time.sleep(2)
             if process.poll() is None:
-                print("Multi-address daemon started successfully!")
-                print("\nManagement commands:")
-                print(f"  Check status: ps aux | grep {os.path.basename(script_path)}")
-                print(f"  Stop daemon: kill $(cat {pidfile})")
-                print(f"  View logs: tail -f {log_file}")
-                print(f"  View errors: tail -f {error_file}")
+                logger.info("daemon started successfully")
+                logger.info("check status command=ps aux | grep %s", os.path.basename(script_path))
+                logger.info("stop daemon command=kill $(cat %s)", pidfile)
+                logger.info("view logs command=tail -f %s", log_file)
+                logger.info("view errors command=tail -f %s", error_file)
                 return True
             else:
-                print("Multi-address daemon failed to start!")
+                logger.error("daemon failed to start")
                 return False
                 
     except Exception as e:
-        print(f"Failed to start multi-address daemon: {e}")
+        logger.exception("failed to start daemon error=%s", e)
         return False
 
 def run_monitor(webhook_url: str, addresses_file: str, background_mode: bool = False):
     """メイン監視ループ（複数アドレス対応）"""
     global main_loop
+    shutdown_requested.clear()
     
     addresses = load_addresses(addresses_file)
     
-    print(f"Loading {len(addresses)} addresses:")
+    logger.info("loaded addresses count=%s", len(addresses))
     for i, (addr, info) in enumerate(addresses.items()):
         tag = info.get('tag')
-        print(f"  {i+1}: {addr}" + (f" (Tag: {tag})" if tag else ""))
+        logger.info("loaded address index=%s address=%s tag=%s", i + 1, addr, tag or "")
     
     # シグナルハンドラーの設定
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     
-    print(f"Process PID: {os.getpid()}")
+    logger.info("process started pid=%s", os.getpid())
     
     try:
         # 新しいイベントループを作成して実行
@@ -834,10 +861,10 @@ def run_monitor(webhook_url: str, addresses_file: str, background_mode: bool = F
             loop.run_until_complete(run_multi_monitor_async(webhook_url, addresses))
             
     except KeyboardInterrupt:
-        print("Keyboard interrupt received, stopping...")
+        logger.info("keyboard interrupt received; stopping")
     except Exception as e:
         error_msg = f"Multi-monitor error: {e}"
-        print(error_msg)
+        logger.exception(error_msg)
         sys.exit(1)
     finally:
         # クリーンアップ
@@ -947,19 +974,19 @@ def main():
     addresses_file = args.addresses_file
     webhook_url = args.webhook_url or os.getenv('DISCORD_WEBHOOK_URL')
     if not webhook_url:
-        sys.stderr.write("Error: DISCORD_WEBHOOK_URL not found in environment variables.\n")
-        sys.stderr.write("Please create a .env file with DISCORD_WEBHOOK_URL=your_webhook_url\n")
+        logger.error("DISCORD_WEBHOOK_URL not found in environment")
+        logger.error("create a .env file with DISCORD_WEBHOOK_URL=your_webhook_url")
         sys.exit(1)
 
     if not os.path.exists(addresses_file):
-        sys.stderr.write(f"Addresses file not found: {addresses_file}\n")
+        logger.error("addresses file not found path=%s", addresses_file)
         sys.exit(1)
 
     if args.daemon and not args.background:
         script_path = os.path.abspath(sys.argv[0])
         addresses = load_addresses(addresses_file)
         
-        print(f"Starting daemon for {len(addresses)} addresses in single process")
+        logger.info("starting daemon for addresses=%s", len(addresses))
         start_daemon(script_path, addresses_file)
         sys.exit(0)
 
