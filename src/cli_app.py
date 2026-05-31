@@ -18,7 +18,13 @@ from hyperliquid.info import Info
 
 from .addresses import load_addresses
 from .models import Trade
-from .ws_monitor import HyperliquidUserFillsMonitor
+from .ws_monitor import (
+    HyperliquidUserFillsMonitor,
+    MINIMAL_META,
+    MINIMAL_SPOT_META,
+    close_info,
+    create_user_fills_info,
+)
 
 load_dotenv()
 
@@ -427,23 +433,14 @@ def bootstrap_seen_fills(address: str, db_path: str) -> None:
         logger.warning("bootstrap db inspect failed address_suffix=%s error=%s", address[-8:], e)
         return
 
-    info = Info(skip_ws=True)
+    info = Info(skip_ws=True, meta=MINIMAL_META, spot_meta=MINIMAL_SPOT_META)
     try:
         fills = info.user_fills(address) or []
     except Exception as e:
         logger.warning("bootstrap user_fills failed address_suffix=%s error=%s", address[-8:], e)
         return
     finally:
-        try:
-            if hasattr(info, "ws_manager") and info.ws_manager:
-                info.ws_manager.stop()
-        except Exception:
-            pass
-        try:
-            if hasattr(info, "session"):
-                info.session.close()
-        except Exception:
-            pass
+        close_info(info)
 
     seeded = 0
     for fill in fills:
@@ -573,21 +570,15 @@ def run_test_preview(
                 done_event.set()
                 return
 
-    info = Info()
+    info = create_user_fills_info()
     for address in addresses.keys():
         info.subscribe({"type": "userFills", "user": address}, callback)
 
     done_event.wait(timeout_seconds)
-    if hasattr(info, "ws_manager") and info.ws_manager:
-        try:
-            info.ws_manager.stop()
-        except Exception as e:
-            logger.warning("error stopping preview websocket error=%s", e)
-    if hasattr(info, "session"):
-        try:
-            info.session.close()
-        except Exception as e:
-            logger.warning("error closing preview session error=%s", e)
+    try:
+        close_info(info)
+    except Exception as e:
+        logger.warning("error closing preview info error=%s", e)
 
     with count_lock:
         printed = count
@@ -629,6 +620,7 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
         'last_trade_time': time.time(),
         'connection_dead': threading.Event()
     }
+    reconnect_attempts = 0
 
     def monitor_callback(trade):
         shared_state['last_trade_time'] = time.time()
@@ -709,6 +701,7 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
                 raise error_container['error']
 
             logger.info("shared monitor started addresses=%s startup_grace_seconds=60", len(addresses))
+            reconnect_attempts = 0
 
             while monitor_thread.is_alive() and not shutdown_requested.is_set():
                 if shared_state['connection_dead'].is_set():
@@ -748,8 +741,13 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
             if shutdown_requested.is_set():
                 logger.info("shutdown requested; skipping reconnect wait")
             else:
-                wait_time = 30
-                logger.info("waiting before reconnect seconds=%s", wait_time)
+                wait_time = min(30 * (2 ** min(reconnect_attempts, 3)), 300)
+                reconnect_attempts += 1
+                logger.info(
+                    "waiting before reconnect seconds=%s next_attempt=%s",
+                    wait_time,
+                    reconnect_attempts,
+                )
                 await asyncio.sleep(wait_time)
 
 async def run_multi_monitor_async(webhook_url: str, addresses: dict):

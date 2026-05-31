@@ -5,11 +5,54 @@ from typing import Any, Callable, Dict, List, Optional
 
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
+from hyperliquid.websocket_manager import WebsocketManager
 
 from .models import Trade
 
 
 logger = logging.getLogger("hdm.ws")
+
+MINIMAL_META = {"universe": []}
+MINIMAL_SPOT_META = {"universe": [], "tokens": []}
+
+
+def close_info(info: Optional[Info]) -> None:
+    if not info:
+        return
+    try:
+        if getattr(info, "ws_manager", None):
+            info.ws_manager.stop()
+            if info.ws_manager.is_alive() and info.ws_manager is not threading.current_thread():
+                info.ws_manager.join(timeout=5)
+            if info.ws_manager.is_alive():
+                logger.warning("websocket manager thread did not stop within timeout")
+    except Exception as e:
+        logger.debug("error stopping websocket manager error=%s", e)
+    try:
+        if hasattr(info, "session"):
+            info.session.close()
+    except Exception as e:
+        logger.debug("error closing info session error=%s", e)
+
+
+def create_user_fills_info(base_url: str = constants.MAINNET_API_URL) -> Info:
+    """Create Info for userFills without opening WS before metadata init succeeds."""
+    info = None
+    try:
+        info = Info(
+            base_url,
+            skip_ws=True,
+            meta=MINIMAL_META,
+            spot_meta=MINIMAL_SPOT_META,
+        )
+        info.ws_manager = WebsocketManager(info.base_url)
+        info.ws_manager.daemon = True
+        info.ws_manager.ping_sender.daemon = True
+        info.ws_manager.start()
+        return info
+    except Exception:
+        close_info(info)
+        raise
 
 
 class HyperliquidUserFillsMonitor:
@@ -22,7 +65,7 @@ class HyperliquidUserFillsMonitor:
         self.addresses = [a.lower() for a in addresses]
         self.address_set = set(self.addresses)
         self.callback = callback
-        self.info = Info(base_url)
+        self.info = create_user_fills_info(base_url)
         self._stop_event = threading.Event()
 
     @staticmethod
@@ -89,13 +132,4 @@ class HyperliquidUserFillsMonitor:
 
     def stop(self) -> None:
         self._stop_event.set()
-        try:
-            if self.info and self.info.ws_manager:
-                self.info.ws_manager.stop()
-        except Exception as e:
-            logger.debug("error stopping websocket manager error=%s", e)
-        try:
-            if self.info and hasattr(self.info, "session"):
-                self.info.session.close()
-        except Exception as e:
-            logger.debug("error closing info session error=%s", e)
+        close_info(self.info)
