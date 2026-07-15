@@ -104,6 +104,36 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v3
 
+      - name: Start dev/stg GCE instance when stopped
+        if: github.event.label.name == 'dev' || github.event.label.name == 'stg'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for _ in {1..60}; do
+            instance_status="$(gcloud compute instances describe "${GCE_INSTANCE_NAME}" \
+              --zone "${{ secrets.GCE_ZONE }}" \
+              --format='value(status)')"
+
+            if [[ "${instance_status}" == "RUNNING" ]]; then
+              echo "Instance ${GCE_INSTANCE_NAME} is RUNNING."
+              exit 0
+            fi
+
+            if [[ "${instance_status}" == "TERMINATED" ]]; then
+              echo "Starting stopped instance ${GCE_INSTANCE_NAME}."
+              gcloud compute instances start "${GCE_INSTANCE_NAME}" \
+                --zone "${{ secrets.GCE_ZONE }}"
+            else
+              echo "Instance ${GCE_INSTANCE_NAME} status is ${instance_status}; waiting."
+            fi
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for ${GCE_INSTANCE_NAME} to reach RUNNING state."
+          exit 1
+
       # 2. Generate .env from secrets
       - name: Generate .env
         run: |
