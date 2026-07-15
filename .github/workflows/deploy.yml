@@ -117,7 +117,7 @@ jobs:
 
             if [[ "${instance_status}" == "RUNNING" ]]; then
               echo "Instance ${GCE_INSTANCE_NAME} is RUNNING."
-              exit 0
+              break
             fi
 
             if [[ "${instance_status}" == "TERMINATED" ]]; then
@@ -131,7 +131,26 @@ jobs:
             sleep 5
           done
 
-          echo "Timed out waiting for ${GCE_INSTANCE_NAME} to reach RUNNING state."
+          if [[ "${instance_status}" != "RUNNING" ]]; then
+            echo "Timed out waiting for ${GCE_INSTANCE_NAME} to reach RUNNING state."
+            exit 1
+          fi
+
+          for _ in {1..30}; do
+            if gcloud compute ssh "${GCE_INSTANCE_NAME}" \
+              --zone "${{ secrets.GCE_ZONE }}" \
+              --command 'true' \
+              --quiet \
+              --ssh-flag='-o ConnectTimeout=5'; then
+              echo "SSH is ready on ${GCE_INSTANCE_NAME}."
+              exit 0
+            fi
+
+            echo "Waiting for SSH on ${GCE_INSTANCE_NAME}."
+            sleep 5
+          done
+
+          echo "Timed out waiting for SSH on ${GCE_INSTANCE_NAME}."
           exit 1
 
       # 2. Generate .env from secrets
