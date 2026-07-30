@@ -869,8 +869,8 @@ def run_monitor(webhook_url: str, addresses_file: str, background_mode: bool = F
         for address, monitor in monitor_instances.items():
             try:
                 monitor.stop()
-            except:
-                pass
+            except Exception:
+                logger.exception("monitor cleanup failed address=%s", address)
         monitor_instances.clear()
 
 def build_parser():
