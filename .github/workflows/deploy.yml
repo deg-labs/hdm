@@ -7,7 +7,7 @@ on:
 
 jobs:
   deploy:
-    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@4c7282a06b34773fad23bad09afe1ab9f951e936
+    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@main
     permissions:
       contents: read
       id-token: write
