@@ -13,10 +13,7 @@
 
 1. `main` ブランチから作業ブランチを作成し、変更を実施します。
 2. `main` 向けにプルリクエストを作成します。
-3. デプロイ先に応じて PR にラベルを付与します。
-   - `dev`：開発環境へデプロイ
-   - `stg`：ステージング環境へデプロイ
-   - `prd`：本番環境へデプロイ
-4. ラベル付与をトリガーにワークフローが実行され、Workload Identity Federation で認証後にインスタンスへ `docker compose` でデプロイされます。
-5. 動作確認後、`main` へマージしてリリースを完了します。
+3. `main` へのマージ後のpushで本番デプロイを行います。開発・ステージング環境へは、Actionsの手動実行で `dev` / `stg` を選択します。
+4. 手動実行も `main` ref に限定され、Workload Identity Federation で認証後にインスタンスへ `docker compose` でデプロイされます。
 
+デプロイ時は、checkoutした信頼済み `main` の `.env.template` に対して `envsubst` を実行し、環境別secretを埋め込んだ `.env` を生成します。生成物はソースアーカイブから除外し、GCEへ個別転送します。
