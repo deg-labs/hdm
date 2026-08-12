@@ -7,18 +7,14 @@ on:
 
 jobs:
   deploy:
-    if: |
-      (github.event_name != 'pull_request' ||
-       github.event.pull_request.head.repo.full_name == github.repository) &&
-      github.ref == 'refs/heads/main'
-    environment: prd
-    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@main
+    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@4c7282a06b34773fad23bad09afe1ab9f951e936
     permissions:
       contents: read
       id-token: write
     secrets: inherit
     with:
       enforce_deploy_team: true
+      environment_name: prd
       start_instance: false
       gce_instance_secret: PRD_GCE_INSTANCE_NAME
       gce_zone_secret: GCE_ZONE
