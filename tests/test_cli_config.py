@@ -51,14 +51,20 @@ class CliConfigTests(unittest.TestCase):
 
     def test_log_levels_are_routed_to_the_expected_stream(self):
         result = self.run_python(
-            "import logging; import src.cli_app; "
+            "import logging; logging.basicConfig(format='legacy %(message)s'); "
+            "import src.cli_app; "
             "logger = logging.getLogger('hdm.test'); "
-            "logger.info('info-marker'); logger.warning('warning-marker')",
+            "logger.info('info-marker'); logger.warning('warning-marker'); "
+            "logger.error('error-marker')",
         )
         self.assertIn("info-marker", result.stdout)
         self.assertNotIn("info-marker", result.stderr)
-        self.assertIn("warning-marker", result.stderr)
-        self.assertNotIn("warning-marker", result.stdout)
+        self.assertIn("warning-marker", result.stdout)
+        self.assertNotIn("warning-marker", result.stderr)
+        self.assertIn("error-marker", result.stderr)
+        self.assertNotIn("error-marker", result.stdout)
+        self.assertNotIn("legacy", result.stdout)
+        self.assertNotIn("legacy", result.stderr)
         self.assertIn("container=", result.stdout)
         self.assertIn("pid=", result.stdout)
         self.assertIn("container=", result.stderr)
