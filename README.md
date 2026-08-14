@@ -164,12 +164,14 @@ python hdm.py tests -f addresses.txt --post
 | --- | --- | --- | --- |
 | `DISCORD_WEBHOOK_URL` | monitor では必須 | なし | デフォルト通知先の Webhook URL |
 | `NOTIFICATION_SUPPRESSION_SECONDS` | 任意 | `60` | 同一アドレス・coin・direction・清算種別の通知を抑制する秒数 |
-| `WEBSOCKET_ACTIVITY_TIMEOUT` | 任意 | `900` | fill を受信しない場合に再接続するまでの秒数 |
+| `USER_FILL_INACTIVITY_RECONNECT_SECONDS` | 任意 | `900` | 監視対象アドレスからuserFillsを受信しない場合に再接続するまでの秒数 |
 | `DB_DIRECTORY` | 任意 | `.` | SQLite DB の保存先 |
 | `HEALTHCHECK_FILE` | 任意 | `/tmp/healthcheck.txt` | 通知対象の fill を処理したときに更新するファイル |
 | `TEST_PREVIEW_TIMEOUT_SECONDS` | 任意 | `60` | `tests` の待機秒数 |
 | `TEST_PREVIEW_MAX_ENTRIES` | 任意 | `10` | `tests` の最大表示件数 |
 | `LOG_LEVEL` | 任意 | `INFO` | Python logging のログレベル（例: `DEBUG`, `INFO`, `WARNING`, `ERROR`） |
+
+`WEBSOCKET_ACTIVITY_TIMEOUT` は後方互換のため引き続き利用できますが、`USER_FILL_INACTIVITY_RECONNECT_SECONDS` を優先してください。ログには実行コンテナのホスト名とプロセスIDを含め、複数コンテナ・プロセスのログが混在しても識別できるようにしています。DEBUG/INFO は stdout、WARNING 以上は stderr に出力します。
 
 ## DB と通知仕様
 
