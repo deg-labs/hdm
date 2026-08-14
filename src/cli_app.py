@@ -8,6 +8,7 @@ import subprocess
 import asyncio
 import threading
 import logging
+import socket
 from datetime import datetime, timezone
 from collections import defaultdict
 import requests
@@ -29,16 +30,43 @@ from .ws_monitor import (
 load_dotenv()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+CONTAINER_ID = socket.gethostname()
+
+
+class _MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int):
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.max_level
+
+
+_log_formatter = logging.Formatter(
+    f"%(asctime)s %(levelname)-8s %(name)s container={CONTAINER_ID} pid=%(process)d %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_stdout_handler = logging.StreamHandler(sys.stdout)
+_stdout_handler.setLevel(logging.DEBUG)
+_stdout_handler.addFilter(_MaxLevelFilter(logging.WARNING))
+_stdout_handler.setFormatter(_log_formatter)
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setLevel(logging.WARNING)
+_stderr_handler.setFormatter(_log_formatter)
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)-8s %(name)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[_stdout_handler, _stderr_handler],
 )
 logger = logging.getLogger("hdm")
 
 # .envから各種設定を読み込む
 NOTIFICATION_SUPPRESSION_SECONDS = int(os.getenv('NOTIFICATION_SUPPRESSION_SECONDS', 60))
-WEBSOCKET_ACTIVITY_TIMEOUT = int(os.getenv('WEBSOCKET_ACTIVITY_TIMEOUT', 900)) # 15分
+USER_FILL_INACTIVITY_RECONNECT_SECONDS = int(
+    os.getenv(
+        'USER_FILL_INACTIVITY_RECONNECT_SECONDS',
+        os.getenv('WEBSOCKET_ACTIVITY_TIMEOUT', 900),
+    )
+) # 15分
 DB_DIRECTORY = os.getenv('DB_DIRECTORY', '.') # デフォルトはカレントディレクトリ
 HEALTHCHECK_FILE = os.getenv('HEALTHCHECK_FILE', '/tmp/healthcheck.txt')
 
@@ -62,6 +90,13 @@ HYPERLIQUID_REQUEST_TIMEOUT = 10
 
 processed_trades = set()
 startup_grace_period = {}
+
+
+def user_fill_inactivity_timed_out(last_user_fill_time, timeout_seconds, now=None):
+    if now is None:
+        now = time.monotonic()
+    return now - last_user_fill_time > timeout_seconds
+
 
 def make_trade_uid(trade: Trade) -> str:
     timestamp = trade.timestamp.isoformat() if trade.timestamp else ""
@@ -617,13 +652,13 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
         }
 
     shared_state = {
-        'last_trade_time': time.time(),
+        'last_user_fill_time': time.monotonic(),
         'connection_dead': threading.Event()
     }
     reconnect_attempts = 0
 
     def monitor_callback(trade):
-        shared_state['last_trade_time'] = time.time()
+        shared_state['last_user_fill_time'] = time.monotonic()
         address_info = address_state.get(trade.address)
         if not address_info:
             return
@@ -639,7 +674,7 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
         monitor = None
         monitor_thread = None
         shared_state['connection_dead'].clear()
-        shared_state['last_trade_time'] = time.time()
+        shared_state['last_user_fill_time'] = time.monotonic()
 
         try:
             logger.info("initializing shared monitor addresses=%s", len(addresses))
@@ -710,8 +745,15 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
                         monitor.stop()
                     break
 
-                if (time.time() - shared_state['last_trade_time']) > WEBSOCKET_ACTIVITY_TIMEOUT:
-                    logger.warning("websocket activity timeout seconds=%s; reconnecting", WEBSOCKET_ACTIVITY_TIMEOUT)
+                if user_fill_inactivity_timed_out(
+                    shared_state['last_user_fill_time'],
+                    USER_FILL_INACTIVITY_RECONNECT_SECONDS,
+                    time.monotonic(),
+                ):
+                    logger.warning(
+                        "user fill inactivity timeout seconds=%s; reconnecting",
+                        USER_FILL_INACTIVITY_RECONNECT_SECONDS,
+                    )
                     shared_state['connection_dead'].set()
                     if monitor:
                         monitor.stop()
