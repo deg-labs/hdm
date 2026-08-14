@@ -171,7 +171,7 @@ python hdm.py tests -f addresses.txt --post
 | `TEST_PREVIEW_MAX_ENTRIES` | 任意 | `10` | `tests` の最大表示件数 |
 | `LOG_LEVEL` | 任意 | `INFO` | Python logging のログレベル（例: `DEBUG`, `INFO`, `WARNING`, `ERROR`） |
 
-`WEBSOCKET_ACTIVITY_TIMEOUT` は後方互換のため引き続き利用できますが、`USER_FILL_INACTIVITY_RECONNECT_SECONDS` を優先してください。ログには実行コンテナのホスト名とプロセスIDを含め、複数コンテナ・プロセスのログが混在しても識別できるようにしています。DEBUG/INFO は stdout、WARNING 以上は stderr に出力します。
+`WEBSOCKET_ACTIVITY_TIMEOUT` は後方互換のため引き続き利用できますが、`USER_FILL_INACTIVITY_RECONNECT_SECONDS` を優先してください。ログには実行コンテナのホスト名とプロセスIDを含め、複数コンテナ・プロセスのログが混在しても識別できるようにしています。DEBUG/INFO/WARNING は stdout、ERROR 以上は stderr に出力します。
 
 ## DB と通知仕様
 
