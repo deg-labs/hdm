@@ -242,18 +242,16 @@ docker compose down
 
 ### GitHub Actions の設定
 
-GitHub リポジトリには、次の Repository Secrets が必要です。`DEV`、`STG`、`PRD` はデプロイ先環境の接頭辞です。
+GitHub リポジトリの `Settings > Environments` に、利用する環境の `dev`、`stg`、`prd` を作成します。各 Environment には、環境ごとに同じ名前の Secret を登録します。
 
-- 環境別 Secret
-  - `DEV_GCP_WIF_PROVIDER` / `STG_GCP_WIF_PROVIDER` / `PRD_GCP_WIF_PROVIDER`
-  - `DEV_GCP_SA_EMAIL` / `STG_GCP_SA_EMAIL` / `PRD_GCP_SA_EMAIL`
-  - `DEV_GCE_INSTANCE_NAME` / `STG_GCE_INSTANCE_NAME` / `PRD_GCE_INSTANCE_NAME`
-  - `DEV_DISCORD_WEBHOOK_URL` / `STG_DISCORD_WEBHOOK_URL` / `PRD_DISCORD_WEBHOOK_URL`
-  - `DEV_ADDRESSES_TXT` / `STG_ADDRESSES_TXT` / `PRD_ADDRESSES_TXT`
-- 共通 Secret
-  - `GCE_ZONE`
-  - `ORG_GH_APP_ID`
-  - `ORG_GH_APP_PRIVATE_KEY`
+- `GCP_WIF_PROVIDER`
+- `GCP_SA_EMAIL`
+- `GCE_INSTANCE_NAME`
+- `GCE_ZONE`
+- `DISCORD_WEBHOOK_URL`
+- `ADDRESSES_TXT`
+
+`ORG_GH_APP_ID` と `ORG_GH_APP_PRIVATE_KEY` は Repository Secret または Organization Secret として登録します。`dev`、`stg`、`prd` の Environment に required reviewers などの保護ルールを設定できます。
 
 Repository Variables には次を設定できます。
 
