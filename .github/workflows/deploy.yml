@@ -37,6 +37,22 @@ jobs:
           github.event_name == 'workflow_dispatch' && inputs.environment ||
           'prd'
         }}
+      discord_webhook_secret: >-
+        ${{
+          (github.event_name == 'pull_request' && github.event.label.name == 'dev' ||
+           github.event_name == 'workflow_dispatch' && inputs.environment == 'dev') && 'DEV_DISCORD_WEBHOOK_URL' ||
+          (github.event_name == 'pull_request' && github.event.label.name == 'stg' ||
+           github.event_name == 'workflow_dispatch' && inputs.environment == 'stg') && 'STG_DISCORD_WEBHOOK_URL' ||
+          'PRD_DISCORD_WEBHOOK_URL'
+        }}
+      addresses_secret: >-
+        ${{
+          (github.event_name == 'pull_request' && github.event.label.name == 'dev' ||
+           github.event_name == 'workflow_dispatch' && inputs.environment == 'dev') && 'DEV_ADDRESSES_TXT' ||
+          (github.event_name == 'pull_request' && github.event.label.name == 'stg' ||
+           github.event_name == 'workflow_dispatch' && inputs.environment == 'stg') && 'STG_ADDRESSES_TXT' ||
+          'PRD_ADDRESSES_TXT'
+        }}
       notification_suppression_seconds: ${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || '3600' }}
       artifact_excludes: |
         data
