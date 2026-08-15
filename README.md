@@ -253,7 +253,7 @@ GitHub リポジトリの `Settings > Secrets and variables > Actions` に、環
 
 `ORG_GH_APP_ID` と `ORG_GH_APP_PRIVATE_KEY` は Repository Secret または Organization Secret として登録します。`dev`、`stg`、`prd` の Environment は required reviewers などの保護ルール用に利用できます。
 
-`DEV_*`、`STG_*`、`PRD_*` はそれぞれ異なる値を登録してください。共有 workflow が `environment_name` に応じて対応する prefix を選択します。既存の `PROD_*` は production の fallback として利用できます。
+`DEV_*`、`STG_*`、`PRD_*` はそれぞれ異なる値を登録してください。caller の deploy workflow が `environment_name` に応じて共有 workflow へ渡す Secret 名を選択します。既存の `PROD_*` は production の fallback として利用できます。
 
 Repository Variables には次を設定できます。
 
