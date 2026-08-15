@@ -242,18 +242,18 @@ docker compose down
 
 ### GitHub Actions の設定
 
-GitHub リポジトリの `Settings > Environments` に、利用する環境の `dev`、`stg`、`prd` を作成します。各 Environment には、環境ごとに同じ名前の Secret を登録します。
+GitHub リポジトリの `Settings > Secrets and variables > Actions` に、環境 prefix 付きの Secret を登録します。
 
-- `GCP_WIF_PROVIDER`
-- `GCP_SA_EMAIL`
-- `GCE_INSTANCE_NAME`
-- `GCE_ZONE`
-- `DISCORD_WEBHOOK_URL`
-- `ADDRESSES_TXT`
+- `DEV_GCP_WIF_PROVIDER` / `STG_GCP_WIF_PROVIDER` / `PRD_GCP_WIF_PROVIDER`
+- `DEV_GCP_SA_EMAIL` / `STG_GCP_SA_EMAIL` / `PRD_GCP_SA_EMAIL`
+- `DEV_GCE_INSTANCE_NAME` / `STG_GCE_INSTANCE_NAME` / `PRD_GCE_INSTANCE_NAME`
+- `DEV_GCE_ZONE` / `STG_GCE_ZONE` / `PRD_GCE_ZONE`
+- `DEV_DISCORD_WEBHOOK_URL` / `STG_DISCORD_WEBHOOK_URL` / `PRD_DISCORD_WEBHOOK_URL`
+- `DEV_ADDRESSES_TXT` / `STG_ADDRESSES_TXT` / `PRD_ADDRESSES_TXT`
 
-`ORG_GH_APP_ID` と `ORG_GH_APP_PRIVATE_KEY` は Repository Secret または Organization Secret として登録します。`dev`、`stg`、`prd` の Environment に required reviewers などの保護ルールを設定できます。
+`ORG_GH_APP_ID` と `ORG_GH_APP_PRIVATE_KEY` は Repository Secret または Organization Secret として登録します。`dev`、`stg`、`prd` の Environment は required reviewers などの保護ルール用に利用できます。
 
-Environment Secret の値は環境ごとに異なります。例えば `dev/GCP_WIF_PROVIDER`、`stg/GCP_WIF_PROVIDER`、`prd/GCP_WIF_PROVIDER` はそれぞれ対応する GCP プロジェクトの値を登録してください。移行期間中は、共有 workflow が既存の `DEV_*`、`STG_*`、`PRD_*`、`PROD_*` Secret も環境に応じて参照します。
+`DEV_*`、`STG_*`、`PRD_*` はそれぞれ異なる値を登録してください。共有 workflow が `environment_name` に応じて対応する prefix を選択します。既存の `PROD_*` は production の fallback として利用できます。
 
 Repository Variables には次を設定できます。
 
