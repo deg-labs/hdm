@@ -31,16 +31,28 @@ jobs:
     secrets: inherit
     with:
       enforce_deploy_team: true
-      environment_name: ${{ github.event_name == 'pull_request' && github.event.label.name || github.event_name == 'workflow_dispatch' && github.event.inputs.environment || 'prd' }}
-      start_instance: ${{ (github.event_name == 'pull_request' && github.event.label.name != 'prd') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment != 'prd') }}
-      gce_instance_secret: ${{ (github.event_name == 'pull_request' && github.event.label.name == 'dev' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev') && 'DEV_GCE_INSTANCE_NAME' || (github.event_name == 'pull_request' && github.event.label.name == 'stg' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'stg') && 'STG_GCE_INSTANCE_NAME' || 'PRD_GCE_INSTANCE_NAME' }}
-      gce_zone_secret: GCE_ZONE
-      gcp_sa_email_secret: ${{ (github.event_name == 'pull_request' && github.event.label.name == 'dev' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev') && 'DEV_GCP_SA_EMAIL' || (github.event_name == 'pull_request' && github.event.label.name == 'stg' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'stg') && 'STG_GCP_SA_EMAIL' || 'PRD_GCP_SA_EMAIL' }}
-      gcp_wif_provider_secret: ${{ (github.event_name == 'pull_request' && github.event.label.name == 'dev' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev') && 'DEV_GCP_WIF_PROVIDER' || (github.event_name == 'pull_request' && github.event.label.name == 'stg' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'stg') && 'STG_GCP_WIF_PROVIDER' || 'PRD_GCP_WIF_PROVIDER' }}
-      discord_webhook_secret: ${{ (github.event_name == 'pull_request' && github.event.label.name == 'dev' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev') && 'DEV_DISCORD_WEBHOOK_URL' || (github.event_name == 'pull_request' && github.event.label.name == 'stg' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'stg') && 'STG_DISCORD_WEBHOOK_URL' || 'PRD_DISCORD_WEBHOOK_URL' }}
-      addresses_secret: ${{ (github.event_name == 'pull_request' && github.event.label.name == 'dev' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev') && 'DEV_ADDRESSES_TXT' || (github.event_name == 'pull_request' && github.event.label.name == 'stg' || github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'stg') && 'STG_ADDRESSES_TXT' || 'PRD_ADDRESSES_TXT' }}
-      github_app_id_secret: ORG_GH_APP_ID
-      github_app_private_key_secret: ORG_GH_APP_PRIVATE_KEY
+      environment_name: >-
+        ${{
+          github.event_name == 'pull_request' && github.event.label.name ||
+          github.event_name == 'workflow_dispatch' && inputs.environment ||
+          'prd'
+        }}
+      discord_webhook_secret: >-
+        ${{
+          (github.event_name == 'pull_request' && github.event.label.name == 'dev' ||
+           github.event_name == 'workflow_dispatch' && inputs.environment == 'dev') && 'DEV_DISCORD_WEBHOOK_URL' ||
+          (github.event_name == 'pull_request' && github.event.label.name == 'stg' ||
+           github.event_name == 'workflow_dispatch' && inputs.environment == 'stg') && 'STG_DISCORD_WEBHOOK_URL' ||
+          'PRD_DISCORD_WEBHOOK_URL'
+        }}
+      addresses_secret: >-
+        ${{
+          (github.event_name == 'pull_request' && github.event.label.name == 'dev' ||
+           github.event_name == 'workflow_dispatch' && inputs.environment == 'dev') && 'DEV_ADDRESSES_TXT' ||
+          (github.event_name == 'pull_request' && github.event.label.name == 'stg' ||
+           github.event_name == 'workflow_dispatch' && inputs.environment == 'stg') && 'STG_ADDRESSES_TXT' ||
+          'PRD_ADDRESSES_TXT'
+        }}
       notification_suppression_seconds: ${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || '3600' }}
       artifact_excludes: |
         data

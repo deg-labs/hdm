@@ -242,18 +242,18 @@ docker compose down
 
 ### GitHub Actions の設定
 
-GitHub リポジトリには、次の Repository Secrets が必要です。`DEV`、`STG`、`PRD` はデプロイ先環境の接頭辞です。
+GitHub リポジトリの `Settings > Secrets and variables > Actions` に、環境 prefix 付きの Secret を登録します。
 
-- 環境別 Secret
-  - `DEV_GCP_WIF_PROVIDER` / `STG_GCP_WIF_PROVIDER` / `PRD_GCP_WIF_PROVIDER`
-  - `DEV_GCP_SA_EMAIL` / `STG_GCP_SA_EMAIL` / `PRD_GCP_SA_EMAIL`
-  - `DEV_GCE_INSTANCE_NAME` / `STG_GCE_INSTANCE_NAME` / `PRD_GCE_INSTANCE_NAME`
-  - `DEV_DISCORD_WEBHOOK_URL` / `STG_DISCORD_WEBHOOK_URL` / `PRD_DISCORD_WEBHOOK_URL`
-  - `DEV_ADDRESSES_TXT` / `STG_ADDRESSES_TXT` / `PRD_ADDRESSES_TXT`
-- 共通 Secret
-  - `GCE_ZONE`
-  - `ORG_GH_APP_ID`
-  - `ORG_GH_APP_PRIVATE_KEY`
+- `DEV_GCP_WIF_PROVIDER` / `STG_GCP_WIF_PROVIDER` / `PRD_GCP_WIF_PROVIDER`
+- `DEV_GCP_SA_EMAIL` / `STG_GCP_SA_EMAIL` / `PRD_GCP_SA_EMAIL`
+- `DEV_GCE_INSTANCE_NAME` / `STG_GCE_INSTANCE_NAME` / `PRD_GCE_INSTANCE_NAME`
+- `DEV_GCE_ZONE` / `STG_GCE_ZONE` / `PRD_GCE_ZONE`
+- `DEV_DISCORD_WEBHOOK_URL` / `STG_DISCORD_WEBHOOK_URL` / `PRD_DISCORD_WEBHOOK_URL`
+- `DEV_ADDRESSES_TXT` / `STG_ADDRESSES_TXT` / `PRD_ADDRESSES_TXT`
+
+`ORG_GH_APP_ID` と `ORG_GH_APP_PRIVATE_KEY` は Repository Secret または Organization Secret として登録します。`dev`、`stg`、`prd` の Environment は required reviewers などの保護ルール用に利用できます。
+
+`DEV_*`、`STG_*`、`PRD_*` はそれぞれ異なる値を登録してください。caller の deploy workflow が `environment_name` に応じて共有 workflow へ渡す Secret 名を選択します。既存の `PROD_*` は production の fallback として利用できます。
 
 Repository Variables には次を設定できます。
 
