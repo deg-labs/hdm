@@ -119,6 +119,132 @@ def touch_healthcheck_file():
     except Exception as e:
         logger.warning("failed to touch healthcheck file path=%s error=%s", HEALTHCHECK_FILE, e)
 
+def _discord_post_url(webhook_url: str) -> str:
+    """wait=true を付けた投稿用URL (レスポンスからメッセージIDを取得するために必要)"""
+    base, sep, query = webhook_url.partition("?")
+    return f"{base}?{query}&wait=true" if sep else f"{base}?wait=true"
+
+
+def _discord_delete_url(webhook_url: str, message_id: str) -> str:
+    """webhookが投稿したメッセージを削除するURL"""
+    base, sep, query = webhook_url.partition("?")
+    url = f"{base}/messages/{message_id}"
+    return f"{url}?{query}" if sep else url
+
+
+def record_discord_message(db_path: str, message_id: str, webhook_url: str) -> None:
+    """投稿したDiscordメッセージのIDを保持件数管理用に記録する"""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO discord_messages (message_id, webhook_url, posted_at) VALUES (?, ?, ?)",
+                (str(message_id), webhook_url, datetime.now(timezone.utc).isoformat()),
+            )
+    except sqlite3.Error as e:
+        logger.error("failed to record discord message id error=%s", e)
+
+
+def get_discord_meta(db_path: str, key: str):
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    except sqlite3.Error:
+        return None
+
+
+def set_discord_meta(db_path: str, key: str, value: str) -> None:
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+    except sqlite3.Error as e:
+        logger.error("failed to write discord meta key=%s error=%s", key, e)
+
+
+def _delete_discord_message(webhook_url: str, message_id: str) -> bool:
+    """webhook経由で古いDiscordメッセージを削除する。成功時True"""
+    for _ in range(3):
+        try:
+            response = requests.delete(_discord_delete_url(webhook_url, message_id), timeout=10)
+            if response.status_code == 429:
+                try:
+                    retry_after = float(response.json().get("retry_after", "1"))
+                except ValueError:
+                    retry_after = 1.0
+                logger.warning(
+                    "rate limited while deleting discord message id=%s waiting=%s",
+                    message_id,
+                    retry_after,
+                )
+                time.sleep(retry_after)
+                continue
+            if response.status_code == 404:
+                return True
+            response.raise_for_status()
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.warning("failed to delete discord message id=%s error=%s", message_id, e)
+            time.sleep(1)
+    return False
+
+
+def cleanup_old_discord_messages(db_path: str, force: bool = False) -> None:
+    """保持件数を超えた古いDiscordメッセージをwebhook経由で削除する (インターバル制御付き)"""
+    keep = int(os.getenv("DISCORD_KEEP_MESSAGES", "50"))
+    interval_hours = int(os.getenv("DISCORD_CLEANUP_INTERVAL_HOURS", "24"))
+    delete_interval = float(os.getenv("DISCORD_DELETE_INTERVAL_SECONDS", "0.5"))
+
+    last_cleanup = get_discord_meta(db_path, "last_discord_cleanup")
+    if not force and last_cleanup:
+        try:
+            elapsed_hours = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(last_cleanup)
+            ).total_seconds() / 3600
+            if elapsed_hours < interval_hours:
+                return
+        except ValueError:
+            pass
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT message_id, webhook_url FROM discord_messages
+                ORDER BY posted_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?
+                """,
+                (max(keep, 0),),
+            )
+            stale = cur.fetchall()
+
+        if not stale:
+            set_discord_meta(db_path, "last_discord_cleanup", datetime.now(timezone.utc).isoformat())
+            return
+
+        logger.info("deleting old discord messages keep=%s count=%s", keep, len(stale))
+        deleted = 0
+        for message_id, webhook_url in stale:
+            if _delete_discord_message(webhook_url, message_id):
+                deleted += 1
+                try:
+                    with sqlite3.connect(db_path) as conn:
+                        conn.execute("DELETE FROM discord_messages WHERE message_id = ?", (message_id,))
+                except sqlite3.Error:
+                    pass
+            time.sleep(delete_interval)
+
+        logger.info("deleted old discord messages deleted=%s total=%s", deleted, len(stale))
+        set_discord_meta(db_path, "last_discord_cleanup", datetime.now(timezone.utc).isoformat())
+    except sqlite3.Error as e:
+        logger.error("discord retention cleanup failed error=%s", e)
+
+
 def send_to_discord(webhook_url: str, message: str = None, embed: dict = None):
     payload = {
         "username": "Hyperliquid Trade Monitor"
@@ -135,18 +261,24 @@ def send_to_discord(webhook_url: str, message: str = None, embed: dict = None):
     for attempt in range(1, max_attempts + 1):
         try:
             response = requests.post(
-                webhook_url,
+                _discord_post_url(webhook_url),
                 data=json.dumps(payload),
                 headers=headers,
                 timeout=10
             )
             response.raise_for_status()
-            return
+            try:
+                data = response.json()
+                msg_id = data.get("id") if isinstance(data, dict) else None
+                return str(msg_id) if msg_id else None
+            except ValueError:
+                return None
         except requests.exceptions.RequestException as e:
             if attempt == max_attempts:
                 logger.error("discord send failed attempts=%s error=%s", max_attempts, e)
-                return
+                return None
             time.sleep(2 ** (attempt - 1))
+    return None
 
 def fetch_spot_meta_index_map():
     global spot_meta_index_cache
@@ -348,13 +480,22 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     embed = build_trade_embed(trade, tag)
 
     logger.info("sending discord notification address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
-    send_to_discord(webhook_url, embed=embed)
+    msg_id = send_to_discord(webhook_url, embed=embed)
+    if msg_id:
+        record_discord_message(db_path, msg_id, webhook_url)
 
     if specific_webhook_url:
         logger.info("sending specific discord notification address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
-        send_to_discord(specific_webhook_url, embed=embed)
+        msg_id2 = send_to_discord(specific_webhook_url, embed=embed)
+        if msg_id2:
+            record_discord_message(db_path, msg_id2, specific_webhook_url)
 
     last_notification_time[suppression_key] = current_time
+
+    try:
+        cleanup_old_discord_messages(db_path)
+    except Exception as e:
+        logger.warning("discord retention cleanup failed error=%s", e)
 
 def ensure_trades_table(db_path: str) -> None:
     try:
@@ -422,6 +563,19 @@ def ensure_trades_table(db_path: str) -> None:
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_trade_uid
                 ON trades(trade_uid)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS discord_messages (
+                    message_id TEXT PRIMARY KEY,
+                    webhook_url TEXT NOT NULL,
+                    posted_at TIMESTAMP NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
             """)
     except sqlite3.Error as e:
         logger.error("sqlite schema setup failed db=%s error=%s", os.path.abspath(db_path), e)
