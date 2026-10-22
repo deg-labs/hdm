@@ -3,3 +3,7 @@ addresses
 trades*.db
 data
 __pycache__
+
+# Python test and runtime caches
+__pycache__/
+.pytest_cache/
