@@ -4,7 +4,6 @@ import sys
 import unittest
 from pathlib import Path
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -59,8 +58,8 @@ class CliConfigTests(unittest.TestCase):
         )
         self.assertIn("info-marker", result.stdout)
         self.assertNotIn("info-marker", result.stderr)
-        self.assertIn("warning-marker", result.stdout)
-        self.assertNotIn("warning-marker", result.stderr)
+        self.assertNotIn("warning-marker", result.stdout)
+        self.assertIn("warning-marker", result.stderr)
         self.assertIn("error-marker", result.stderr)
         self.assertNotIn("error-marker", result.stdout)
         self.assertNotIn("legacy", result.stdout)

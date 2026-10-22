@@ -63,17 +63,12 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y gettext-base
         export DB_DIRECTORY='./data'
+        export DISCORD_KEEP_MESSAGES="${{ vars.DISCORD_KEEP_MESSAGES || '50' }}"
+        export DISCORD_CLEANUP_INTERVAL_HOURS="${{ vars.DISCORD_CLEANUP_INTERVAL_HOURS || '24' }}"
+        export DISCORD_DELETE_INTERVAL_SECONDS="${{ vars.DISCORD_DELETE_INTERVAL_SECONDS || '0.5' }}"
+        export DISCORD_MESSAGE_MAX_AGE_HOURS="${{ vars.DISCORD_MESSAGE_MAX_AGE_HOURS || '0' }}"
         envsubst < .env.template > .env
         printf '%s' "${ADDRESSES_TXT}" > addresses.txt
       remote_deploy_command: |
-        set -e
-        TARGET_DIR='/opt/apps/hdm'
-        sudo rm -rf "$TARGET_DIR"
-        sudo mkdir -p "$TARGET_DIR"
-        sudo chown -R "$(id -u):$(id -g)" "$TARGET_DIR"
-        tar -xzf ~/app.tar.gz -C "$TARGET_DIR"
-        mv -f ~/.env "$TARGET_DIR/.env"
-        cd "$TARGET_DIR"
-        sudo docker compose down
-        sudo docker compose up -d --build
-        sudo docker image prune -f || true
+        set -euo pipefail
+        tar -xOf ~/app.tar.gz ./ops/deploy.sh | sudo bash -s -- "$HOME/app.tar.gz" "$HOME/.env"
