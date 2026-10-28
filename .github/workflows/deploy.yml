@@ -19,12 +19,38 @@ on:
         default: prd
 
 jobs:
+  prepare:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' &&
+       (github.event.label.name == 'dev' || github.event.label.name == 'stg' || github.event.label.name == 'prd'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pack deployment artifact
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=.github --exclude=.env --exclude='.env.*' --exclude-from=.gce-deployignore -czf "$RUNNER_TEMP/deploy.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: gce-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/deploy.tar.gz
+          if-no-files-found: error
+
   deploy:
+    needs: prepare
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action == 'labeled' &&
        (github.event.label.name == 'dev' || github.event.label.name == 'stg'))
-    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@06a6411839e846ff83ebba4fc0455221c7aa5e3e
+    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@111a5e00f0cd9d8f7e1dcfa61529252b3cf7124b
     permissions:
       contents: read
       id-token: write
@@ -37,7 +63,7 @@ jobs:
           github.event_name == 'workflow_dispatch' && inputs.environment ||
           'prd'
         }}
-      discord_webhook_secret: >-
+      runtime_env_secret: >-
         ${{
           (github.event_name == 'pull_request' && github.event.label.name == 'dev' ||
            github.event_name == 'workflow_dispatch' && inputs.environment == 'dev') && 'DEV_DISCORD_WEBHOOK_URL' ||
@@ -45,7 +71,7 @@ jobs:
            github.event_name == 'workflow_dispatch' && inputs.environment == 'stg') && 'STG_DISCORD_WEBHOOK_URL' ||
           'PRD_DISCORD_WEBHOOK_URL'
         }}
-      addresses_secret: >-
+      runtime_file_secret: >-
         ${{
           (github.event_name == 'pull_request' && github.event.label.name == 'dev' ||
            github.event_name == 'workflow_dispatch' && inputs.environment == 'dev') && 'DEV_ADDRESSES_TXT' ||
@@ -53,5 +79,7 @@ jobs:
            github.event_name == 'workflow_dispatch' && inputs.environment == 'stg') && 'STG_ADDRESSES_TXT' ||
           'PRD_ADDRESSES_TXT'
         }}
-      notification_suppression_seconds: ${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || '3600' }}
       deploy_mode: compose
+      artifact_id: ${{ needs.prepare.outputs.artifact_id }}
+      runtime_env_key: DISCORD_WEBHOOK_URL
+      runtime_file_name: addresses.txt

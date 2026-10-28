@@ -12,7 +12,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY hdm.py .
 COPY src ./src
-COPY addresses.txt .
-COPY .env .
 
 CMD ["python", "hdm.py", "addresses.txt"]
