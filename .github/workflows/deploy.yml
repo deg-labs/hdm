@@ -24,7 +24,7 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.action == 'labeled' &&
        (github.event.label.name == 'dev' || github.event.label.name == 'stg'))
-    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@main
+    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@6828f512b6065d45b92cec65035690318e108ef5
     permissions:
       contents: read
       id-token: write
@@ -54,26 +54,4 @@ jobs:
           'PRD_ADDRESSES_TXT'
         }}
       notification_suppression_seconds: ${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || '3600' }}
-      artifact_excludes: |
-        data
-      additional_upload_files: |
-        .env
-      prepare_command: |
-        set -euo pipefail
-        sudo apt-get update
-        sudo apt-get install -y gettext-base
-        export DB_DIRECTORY='./data'
-        envsubst < .env.template > .env
-        printf '%s' "${ADDRESSES_TXT}" > addresses.txt
-      remote_deploy_command: |
-        set -e
-        TARGET_DIR='/opt/apps/hdm'
-        sudo rm -rf "$TARGET_DIR"
-        sudo mkdir -p "$TARGET_DIR"
-        sudo chown -R "$(id -u):$(id -g)" "$TARGET_DIR"
-        tar -xzf ~/app.tar.gz -C "$TARGET_DIR"
-        mv -f ~/.env "$TARGET_DIR/.env"
-        cd "$TARGET_DIR"
-        sudo docker compose down
-        sudo docker compose up -d --build
-        sudo docker image prune -f || true
+      deploy_mode: compose
