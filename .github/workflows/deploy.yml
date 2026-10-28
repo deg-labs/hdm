@@ -36,6 +36,7 @@ jobs:
       - name: Pack deployment artifact
         run: |
           set -euo pipefail
+          printf '%s\n' "$GITHUB_SHA" > .gce-deploy-source
           tar --exclude=.git --exclude=.github --exclude=.env --exclude='.env.*' --exclude-from=.gce-deployignore -czf "$RUNNER_TEMP/deploy.tar.gz" .
       - uses: actions/upload-artifact@v4
         id: upload
@@ -50,7 +51,7 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.action == 'labeled' &&
        (github.event.label.name == 'dev' || github.event.label.name == 'stg'))
-    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@111a5e00f0cd9d8f7e1dcfa61529252b3cf7124b
+    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@3cef09fbaa8b20040b2a923f728c1d560ec41b03
     permissions:
       contents: read
       id-token: write
