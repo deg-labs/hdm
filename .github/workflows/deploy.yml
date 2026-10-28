@@ -51,7 +51,7 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.action == 'labeled' &&
        (github.event.label.name == 'dev' || github.event.label.name == 'stg'))
-    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@ca2540fb9d7561373d4b91d5d2e1ffd83e22b2c8
+    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@4445f551aacd33e6f77076dc225c2da175da2f5c
     permissions:
       contents: read
       id-token: write
