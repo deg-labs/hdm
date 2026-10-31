@@ -8,6 +8,8 @@ services:
         hard: 65535
     environment:
       - TZ=Asia/Tokyo
+      - DB_DIRECTORY=./data
+      - NOTIFICATION_SUPPRESSION_SECONDS=3600
     env_file:
       - ./.env
     volumes:

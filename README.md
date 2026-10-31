@@ -275,4 +275,6 @@ Discord が投稿を受理した後に応答を失った場合の ID や、導�
 
 監視中は通知の有無と独立して毎分すべての `trades_*.db` を巡回します。監視を外したアドレスと、投稿を有効にしたプレビューの ID も対象です。応答タイムアウト後の POST は重複投稿を増やさないため再送しません（接続タイムアウトと明示的な429は再試行）。
 
-デプロイは `ops/deploy.sh ARCHIVE ENV_FILE [TARGET_DIR]` を使用します。既存コンテナを停止して `/app/data` の DB・WAL・復旧ファイルを `TARGET_DIR/data` に移してから再作成し、以後は bind mount で保持します。競合する既存 DB があれば上書きせずデプロイを中止し、旧コンテナを残します。旧 `/app/data` を取得できない場合も削除を進めません。`TARGET_DIR/data` を配置時に削除しないでください。
+通常のデプロイは共有の `gce-deploy.yml` が `/opt/apps/hdm` を削除せず上書きし、`docker compose up -d --build` で再作成するため、bind mount した `data/` はそのまま保持されます。
+
+旧バージョンで DB をコンテナ内の `/app/data` に置いていた環境では、初回のみ GCE 上で `ops/deploy.sh ARCHIVE ENV_FILE [TARGET_DIR]` を実行して DB・WAL・復旧ファイルを `TARGET_DIR/data` へ移してください。既存コンテナを停止してから移行し、競合する既存 DB があれば上書きせずデプロイを中止して旧コンテナを残します。旧 `/app/data` を取得できない場合も削除を進めません。`TARGET_DIR/data` を配置時に削除しないでください。
