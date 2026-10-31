@@ -37,7 +37,20 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' "$GITHUB_SHA" > .gce-deploy-source
-          tar --exclude=.git --exclude=.github --exclude=.env --exclude='.env.*' --exclude-from=.gce-deployignore -czf "$RUNNER_TEMP/deploy.tar.gz" .
+          tar --exclude=.git --exclude=.github --exclude='*.[eE][nN][vV]*' --exclude-from=.gce-deployignore -czf "$RUNNER_TEMP/deploy.tar.gz" .
+      - name: Reject environment files before upload
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/deploy.tar.gz" <<'PYTHON'
+          import pathlib
+          import sys
+          import tarfile
+
+          with tarfile.open(sys.argv[1], "r:gz") as archive:
+              for member in archive:
+                  if any(".env" in part.lower() for part in pathlib.PurePosixPath(member.name).parts):
+                      raise SystemExit("Environment-like path found in deployment artifact; upload blocked")
+          PYTHON
       - uses: actions/upload-artifact@v4
         id: upload
         with:
@@ -51,7 +64,7 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.action == 'labeled' &&
        (github.event.label.name == 'dev' || github.event.label.name == 'stg'))
-    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@4445f551aacd33e6f77076dc225c2da175da2f5c
+    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@6b92c4d72db7cd561b3c6b3e7f05e8a184dfccc3
     permissions:
       contents: read
       id-token: write
