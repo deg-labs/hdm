@@ -14,6 +14,9 @@ from collections import defaultdict
 import requests
 import json
 import sqlite3
+from pathlib import Path
+from contextlib import suppress
+from . import discord_retention as retention
 from dotenv import load_dotenv
 from hyperliquid.info import Info
 
@@ -48,10 +51,10 @@ _log_formatter = logging.Formatter(
 )
 _stdout_handler = logging.StreamHandler(sys.stdout)
 _stdout_handler.setLevel(logging.DEBUG)
-_stdout_handler.addFilter(_MaxLevelFilter(logging.ERROR))
+_stdout_handler.addFilter(_MaxLevelFilter(logging.WARNING))
 _stdout_handler.setFormatter(_log_formatter)
 _stderr_handler = logging.StreamHandler(sys.stderr)
-_stderr_handler.setLevel(logging.ERROR)
+_stderr_handler.setLevel(logging.WARNING)
 _stderr_handler.setFormatter(_log_formatter)
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -120,28 +123,15 @@ def touch_healthcheck_file():
         logger.warning("failed to touch healthcheck file path=%s error=%s", HEALTHCHECK_FILE, e)
 
 def _discord_post_url(webhook_url: str) -> str:
-    """wait=true を付けた投稿用URL (レスポンスからメッセージIDを取得するために必要)"""
-    base, sep, query = webhook_url.partition("?")
-    return f"{base}?{query}&wait=true" if sep else f"{base}?wait=true"
+    return retention.post_url(webhook_url)
 
 
 def _discord_delete_url(webhook_url: str, message_id: str) -> str:
-    """webhookが投稿したメッセージを削除するURL"""
-    base, sep, query = webhook_url.partition("?")
-    url = f"{base}/messages/{message_id}"
-    return f"{url}?{query}" if sep else url
+    return retention.message_url(webhook_url, message_id)
 
 
 def record_discord_message(db_path: str, message_id: str, webhook_url: str) -> None:
-    """投稿したDiscordメッセージのIDを保持件数管理用に記録する"""
-    try:
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO discord_messages (message_id, webhook_url, posted_at) VALUES (?, ?, ?)",
-                (str(message_id), webhook_url, datetime.now(timezone.utc).isoformat()),
-            )
-    except sqlite3.Error as e:
-        logger.error("failed to record discord message id error=%s", e)
+    retention.record_message(db_path, message_id, webhook_url, logger)
 
 
 def get_discord_meta(db_path: str, key: str):
@@ -167,117 +157,137 @@ def set_discord_meta(db_path: str, key: str, value: str) -> None:
 
 
 def _delete_discord_message(webhook_url: str, message_id: str) -> bool:
-    """webhook経由で古いDiscordメッセージを削除する。成功時True"""
     for _ in range(3):
         try:
-            response = requests.delete(_discord_delete_url(webhook_url, message_id), timeout=10)
-            if response.status_code == 429:
-                try:
-                    retry_after = float(response.json().get("retry_after", "1"))
-                except ValueError:
-                    retry_after = 1.0
-                logger.warning(
-                    "rate limited while deleting discord message id=%s waiting=%s",
-                    message_id,
-                    retry_after,
-                )
-                time.sleep(retry_after)
-                continue
-            if response.status_code == 404:
+            response = requests.delete(
+                _discord_delete_url(webhook_url, message_id), timeout=10
+            )
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            if retention.deletion_confirmed(response.status_code, body):
                 return True
-            response.raise_for_status()
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.warning("failed to delete discord message id=%s error=%s", message_id, e)
-            time.sleep(1)
+            if response.status_code == 429:
+                time.sleep(retention.retry_delay(body))
+                continue
+            logger.warning(
+                "Discord delete deferred id=%s status=%s code=%s",
+                message_id,
+                response.status_code,
+                retention.error_code(body),
+            )
+            if response.status_code < 500:
+                return False
+        except requests.exceptions.RequestException as error:
+            logger.warning(
+                "Discord delete deferred id=%s error_type=%s",
+                message_id,
+                type(error).__name__,
+            )
+        except (ValueError, TypeError):
+            logger.warning("Invalid Discord retry response id=%s", message_id)
+            return False
+        time.sleep(1)
     return False
 
 
 def cleanup_old_discord_messages(db_path: str, force: bool = False) -> None:
-    """保持件数を超えた古いDiscordメッセージをwebhook経由で削除する (インターバル制御付き)"""
     keep = int(os.getenv("DISCORD_KEEP_MESSAGES", "50"))
-    interval_hours = int(os.getenv("DISCORD_CLEANUP_INTERVAL_HOURS", "24"))
+    interval = float(os.getenv("DISCORD_CLEANUP_INTERVAL_HOURS", "24"))
+    max_age = retention.max_age_hours(os.getenv("DISCORD_MESSAGE_MAX_AGE_HOURS", "0"))
     delete_interval = float(os.getenv("DISCORD_DELETE_INTERVAL_SECONDS", "0.5"))
-
-    last_cleanup = get_discord_meta(db_path, "last_discord_cleanup")
-    if not force and last_cleanup:
-        try:
-            elapsed_hours = (
-                datetime.now(timezone.utc) - datetime.fromisoformat(last_cleanup)
-            ).total_seconds() / 3600
-            if elapsed_hours < interval_hours:
-                return
-        except ValueError:
-            pass
-
+    if max_age:
+        interval = min(interval, 5 / 60)
+    recovered = retention.recover_pending(db_path, logger)
+    if not force and not retention.cleanup_due(
+        get_discord_meta(db_path, "last_discord_cleanup"), interval
+    ):
+        return
     try:
         with sqlite3.connect(db_path) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT message_id, webhook_url FROM discord_messages
-                ORDER BY posted_at DESC, rowid DESC
-                LIMIT -1 OFFSET ?
-                """,
-                (max(keep, 0),),
-            )
-            stale = cur.fetchall()
-
-        if not stale:
-            set_discord_meta(db_path, "last_discord_cleanup", datetime.now(timezone.utc).isoformat())
-            return
-
-        logger.info("deleting old discord messages keep=%s count=%s", keep, len(stale))
+            rows = conn.execute("""SELECT message_id, posted_at, webhook_url
+                FROM discord_messages ORDER BY posted_at DESC, rowid DESC""").fetchall()
+        stale = retention.stale_rows(rows, keep, max_age)
+        complete = recovered
         deleted = 0
-        for message_id, webhook_url in stale:
+        for message_id, posted_at, webhook_url in stale:
             if _delete_discord_message(webhook_url, message_id):
+                with sqlite3.connect(db_path) as conn:
+                    conn.execute(
+                        "DELETE FROM discord_messages WHERE message_id=?", (message_id,)
+                    )
                 deleted += 1
-                try:
-                    with sqlite3.connect(db_path) as conn:
-                        conn.execute("DELETE FROM discord_messages WHERE message_id = ?", (message_id,))
-                except sqlite3.Error:
-                    pass
+            else:
+                complete = False
             time.sleep(delete_interval)
+        if complete:
+            set_discord_meta(
+                db_path, "last_discord_cleanup", datetime.now(timezone.utc).isoformat()
+            )
+        logger.info(
+            "Discord cleanup deleted=%s candidates=%s complete=%s",
+            deleted,
+            len(stale),
+            complete,
+        )
+    except sqlite3.Error as error:
+        logger.error("Discord cleanup DB failure error_type=%s", type(error).__name__)
 
-        logger.info("deleted old discord messages deleted=%s total=%s", deleted, len(stale))
-        set_discord_meta(db_path, "last_discord_cleanup", datetime.now(timezone.utc).isoformat())
-    except sqlite3.Error as e:
-        logger.error("discord retention cleanup failed error=%s", e)
+
+def cleanup_discord_databases():
+    # Include addresses removed from the subscription list and preview-only DBs.
+    for path in Path(DB_DIRECTORY).glob("trades_*.db"):
+        try:
+            ensure_trades_table(str(path))
+            cleanup_old_discord_messages(str(path))
+        except Exception:
+            logger.exception("Discord retention sweep failed db=%s", path.name)
+
+
+async def discord_retention_loop():
+    while not shutdown_requested.is_set():
+        await asyncio.to_thread(cleanup_discord_databases)
+        await asyncio.sleep(60)
 
 
 def send_to_discord(webhook_url: str, message: str = None, embed: dict = None):
-    payload = {
-        "username": "Hyperliquid Trade Monitor"
-    }
+    payload = {"username": "Hyperliquid Trade Monitor"}
     if message:
         payload["content"] = message
     if embed:
         payload["embeds"] = [embed]
-        
-    headers = {
-        "Content-Type": "application/json"
-    }
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(3):
         try:
             response = requests.post(
-                _discord_post_url(webhook_url),
-                data=json.dumps(payload),
-                headers=headers,
-                timeout=10
+                _discord_post_url(webhook_url), json=payload, timeout=10
             )
+            if response.status_code == 429:
+                body = response.json()
+                time.sleep(retention.retry_delay(body))
+                continue
             response.raise_for_status()
-            try:
-                data = response.json()
-                msg_id = data.get("id") if isinstance(data, dict) else None
-                return str(msg_id) if msg_id else None
-            except ValueError:
-                return None
-        except requests.exceptions.RequestException as e:
-            if attempt == max_attempts:
-                logger.error("discord send failed attempts=%s error=%s", max_attempts, e)
-                return None
-            time.sleep(2 ** (attempt - 1))
+            body = response.json()
+            message_id = body.get("id") if isinstance(body, dict) else None
+            if message_id:
+                return str(message_id)
+            logger.error(
+                "Discord POST returned no message ID; delivery cannot be tracked"
+            )
+            return None
+        except requests.exceptions.ConnectTimeout:
+            # A connect timeout is safe to retry; a lost response is not.
+            time.sleep(2**attempt)
+        except requests.exceptions.RequestException as error:
+            logger.error(
+                "Discord send outcome uncertain; POST not retried error_type=%s",
+                type(error).__name__,
+            )
+            return None
+        except (ValueError, TypeError):
+            logger.error("Discord POST returned an invalid message response")
+            return None
+    logger.error("Discord send exhausted retries")
     return None
 
 def fetch_spot_meta_index_map():
@@ -492,10 +502,6 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
 
     last_notification_time[suppression_key] = current_time
 
-    try:
-        cleanup_old_discord_messages(db_path)
-    except Exception as e:
-        logger.warning("discord retention cleanup failed error=%s", e)
 
 def ensure_trades_table(db_path: str) -> None:
     try:
@@ -690,15 +696,23 @@ def run_test_preview(
     addresses_file: str,
     enable_posting: bool = False,
     timeout_seconds: int = None,
-    max_entries: int = None
+    max_entries: int = None,
 ):
     if not os.path.exists(addresses_file):
         logger.error("addresses file not found path=%s", addresses_file)
         return
 
     addresses = load_addresses(addresses_file)
-    timeout_seconds = int(timeout_seconds if timeout_seconds is not None else os.getenv("TEST_PREVIEW_TIMEOUT_SECONDS", 60))
-    max_entries = int(max_entries if max_entries is not None else os.getenv("TEST_PREVIEW_MAX_ENTRIES", 10))
+    timeout_seconds = int(
+        timeout_seconds
+        if timeout_seconds is not None
+        else os.getenv("TEST_PREVIEW_TIMEOUT_SECONDS", 60)
+    )
+    max_entries = int(
+        max_entries
+        if max_entries is not None
+        else os.getenv("TEST_PREVIEW_MAX_ENTRIES", 10)
+    )
     count = 0
     seen_hashes = set()
     pending = set(addresses.keys())
@@ -706,7 +720,11 @@ def run_test_preview(
     count_lock = threading.Lock()
     done_event = threading.Event()
 
-    logger.info("starting websocket preview addresses=%s timeout_seconds=%s", len(addresses), timeout_seconds)
+    logger.info(
+        "starting websocket preview addresses=%s timeout_seconds=%s",
+        len(addresses),
+        timeout_seconds,
+    )
     if enable_posting:
         logger.warning("discord posting is enabled for preview")
     logger.info("preview max entries=%s", max_entries)
@@ -739,8 +757,8 @@ def run_test_preview(
                     pending.remove(address)
             trade = HyperliquidUserFillsMonitor.build_trade_from_fill(fill, address)
             info = addresses.get(trade.address)
-            tag = info.get('tag') if info else None
-            specific_webhook = info.get('webhook') if info else None
+            tag = info.get("tag") if info else None
+            specific_webhook = info.get("webhook") if info else None
             embed = build_trade_embed(trade, tag)
             print("\n-----")
             print(f"Title: {embed['title']}")
@@ -748,13 +766,21 @@ def run_test_preview(
             print(embed["footer"]["text"])
 
             if enable_posting:
-                webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+                webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
                 if webhook_url:
                     logger.info("preview sending to global webhook")
-                    send_to_discord(webhook_url, embed=embed)
+                    message_id = send_to_discord(webhook_url, embed=embed)
+                    if message_id:
+                        preview_db = os.path.join(DB_DIRECTORY, "trades_preview.db")
+                        ensure_trades_table(preview_db)
+                        record_discord_message(preview_db, message_id, webhook_url)
                 if specific_webhook:
                     logger.info("preview sending to specific webhook")
-                    send_to_discord(specific_webhook, embed=embed)
+                    message_id = send_to_discord(specific_webhook, embed=embed)
+                    if message_id:
+                        preview_db = os.path.join(DB_DIRECTORY, "trades_preview.db")
+                        ensure_trades_table(preview_db)
+                        record_discord_message(preview_db, message_id, specific_webhook)
 
             if count >= max_entries or not pending:
                 done_event.set()
@@ -770,10 +796,15 @@ def run_test_preview(
     except Exception as e:
         logger.warning("error closing preview info error=%s", e)
 
+    if enable_posting:
+        cleanup_discord_databases()
+
     with count_lock:
         printed = count
     if printed < max_entries:
-        logger.info("preview timeout reached printed=%s max_entries=%s", printed, max_entries)
+        logger.info(
+            "preview timeout reached printed=%s max_entries=%s", printed, max_entries
+        )
 
 def write_pidfile(pidfile):
     try:
@@ -952,14 +983,21 @@ async def run_multi_monitor_async(webhook_url: str, addresses: dict):
     logger.info("starting multi-address monitor addresses=%s", len(addresses))
 
     for i, (address, info) in enumerate(addresses.items()):
-        tag = info.get('tag')
-        logger.info("configured address index=%s address=%s tag=%s", i, address, tag or "")
+        tag = info.get("tag")
+        logger.info(
+            "configured address index=%s address=%s tag=%s", i, address, tag or ""
+        )
 
+    retention_task = asyncio.create_task(discord_retention_loop())
     try:
         await monitor_addresses_async(webhook_url, addresses)
     except Exception as e:
         logger.exception("multi-monitor failed error=%s", e)
         raise
+    finally:
+        retention_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await retention_task
 
 def signal_handler(signum, frame):
     global monitor_instances, main_loop
