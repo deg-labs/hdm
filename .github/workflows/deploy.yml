@@ -19,12 +19,52 @@ on:
         default: prd
 
 jobs:
+  prepare:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action == 'labeled' &&
+       (github.event.label.name == 'dev' || github.event.label.name == 'stg' || github.event.label.name == 'prd'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pack deployment artifact
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GITHUB_SHA" > .gce-deploy-source
+          tar --exclude=.git --exclude=.github --exclude='*.[eE][nN][vV]*' --exclude-from=.gce-deployignore -czf "$RUNNER_TEMP/deploy.tar.gz" .
+      - name: Reject environment files before upload
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/deploy.tar.gz" <<'PYTHON'
+          import pathlib
+          import sys
+          import tarfile
+
+          with tarfile.open(sys.argv[1], "r:gz") as archive:
+              for member in archive:
+                  if any(".env" in part.lower() for part in pathlib.PurePosixPath(member.name).parts):
+                      raise SystemExit("Environment-like path found in deployment artifact; upload blocked")
+          PYTHON
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: gce-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/deploy.tar.gz
+          if-no-files-found: error
+
   deploy:
+    needs: prepare
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action == 'labeled' &&
        (github.event.label.name == 'dev' || github.event.label.name == 'stg'))
-    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@06a6411839e846ff83ebba4fc0455221c7aa5e3e
+    uses: deg-labs/github-workflows/.github/workflows/gce-deploy.yml@6b92c4d72db7cd561b3c6b3e7f05e8a184dfccc3
     permissions:
       contents: read
       id-token: write
@@ -37,7 +77,7 @@ jobs:
           github.event_name == 'workflow_dispatch' && inputs.environment ||
           'prd'
         }}
-      discord_webhook_secret: >-
+      runtime_env_secret: >-
         ${{
           (github.event_name == 'pull_request' && github.event.label.name == 'dev' ||
            github.event_name == 'workflow_dispatch' && inputs.environment == 'dev') && 'DEV_DISCORD_WEBHOOK_URL' ||
@@ -45,7 +85,7 @@ jobs:
            github.event_name == 'workflow_dispatch' && inputs.environment == 'stg') && 'STG_DISCORD_WEBHOOK_URL' ||
           'PRD_DISCORD_WEBHOOK_URL'
         }}
-      addresses_secret: >-
+      runtime_file_secret: >-
         ${{
           (github.event_name == 'pull_request' && github.event.label.name == 'dev' ||
            github.event_name == 'workflow_dispatch' && inputs.environment == 'dev') && 'DEV_ADDRESSES_TXT' ||
@@ -53,5 +93,7 @@ jobs:
            github.event_name == 'workflow_dispatch' && inputs.environment == 'stg') && 'STG_ADDRESSES_TXT' ||
           'PRD_ADDRESSES_TXT'
         }}
-      notification_suppression_seconds: ${{ vars.NOTIFICATION_SUPPRESSION_SECONDS || '3600' }}
       deploy_mode: compose
+      artifact_id: ${{ needs.prepare.outputs.artifact_id }}
+      runtime_env_key: DISCORD_WEBHOOK_URL
+      runtime_file_name: addresses.txt
