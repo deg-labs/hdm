@@ -84,10 +84,10 @@ def _initial_embed(trade, tag):
     return {
         "title": title,
         "description": (
-            f"最初のエントリーを検知\\n"
-            f"Coin: {trade.coin}\\n"
-            f"Price: {trade.price}\\n"
-            f"Direction: {direction}\\n"
+            f"最初のエントリーを検知\n"
+            f"Coin: {trade.coin}\n"
+            f"Price: {trade.price}\n"
+            f"Direction: {direction}\n"
             f"Address: https://hypurrscan.io/address/{trade.address}"
         ),
         "color": 0x00FF00 if "Long" in direction else 0xFF0000,
