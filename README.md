@@ -163,10 +163,10 @@ python hdm.py tests -f addresses.txt --post
 | 変数 | 必須 | 既定値 | 説明 |
 | --- | --- | --- | --- |
 | `DISCORD_WEBHOOK_URL` | monitor では必須 | なし | デフォルト通知先の Webhook URL |
-| `NOTIFICATION_SUPPRESSION_SECONDS` | 任意 | `60` | 最後の約定から最終POSTを行うまでの静穏秒数（通知抑止ではありません） |
+| `NOTIFICATION_SUPPRESSION_SECONDS` | 任意 | `600` | 最後の約定から最終POSTを行うまでの静穏秒数（通知抑止ではありません） |
 | `USER_FILL_INACTIVITY_RECONNECT_SECONDS` | 任意 | `900` | 監視対象アドレスからuserFillsを受信しない場合に再接続するまでの秒数 |
 | `DB_DIRECTORY` | 任意 | `.` | SQLite DB の保存先 |
-| `HEALTHCHECK_FILE` | 任意 | `/tmp/healthcheck.txt` | 通知対象の fill を処理したときに更新するファイル |
+| `HEALTHCHECK_FILE` | 任意 | `/tmp/healthcheck.txt` | WebSocket監視ループの生存確認用ファイル。取引がなくても監視中は約10秒ごとに更新 |
 | `TEST_PREVIEW_TIMEOUT_SECONDS` | 任意 | `60` | `tests` の待機秒数 |
 | `TEST_PREVIEW_MAX_ENTRIES` | 任意 | `10` | `tests` の最大表示件数 |
 | `LOG_LEVEL` | 任意 | `INFO` | Python logging のログレベル（例: `DEBUG`, `INFO`, `WARNING`, `ERROR`） |
@@ -230,7 +230,7 @@ docker compose logs -f
 docker compose down
 ```
 
-`docker-compose.yml` はホストの `addresses.txt` を `/app/addresses.txt` に bind mount します。Dockerfile はビルド時に `.env` もイメージへコピーするため、`.env` の取り扱いとイメージの共有範囲に注意してください。
+`docker-compose.yml` はホストの `addresses.txt` を `/app/addresses.txt` に bind mount し、`.env` は `env_file` として実行時に読み込みます。Dockerfileには `.env` をコピーしません。監視スレッドが正常に動いていれば取引がなくてもヘルスチェック用ハートビートを更新します（30秒間隔で検査、120秒以上更新がない場合は失敗、起動猶予60秒）。
 
 ## リリース / デプロイ方法
 
@@ -273,7 +273,7 @@ GitHub リポジトリの `Settings > Secrets and variables > Actions` に、環
 
 Repository Variables には次を設定できます。
 
-- `NOTIFICATION_SUPPRESSION_SECONDS`（未設定時はデプロイワークフロー側で `3600`）
+- `NOTIFICATION_SUPPRESSION_SECONDS` はローカルでは `.env` から読み込みます。Composeによる上書きはしません。未設定時はアプリ側の既定値 `600` 秒です。現行の共有GCEデプロイワークフローはWebhookなどの最小限の環境変数のみを生成するため、GCE側にもこの値が必要な場合はデプロイ側の環境変数生成方法を拡張してください。
 
 デプロイ時には `.env.template` へ環境別 Webhook と DB 設定を `envsubst` で埋め込み、Secret から生成した `addresses.txt` とともに GCE へ転送します。生成した `.env` はソースアーカイブには含めず、GCE 上の `/opt/apps/hdm/.env` として配置されます。
 
