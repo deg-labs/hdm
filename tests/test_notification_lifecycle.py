@@ -90,3 +90,42 @@ def test_discord_retry_does_not_lose_last_event(tmp_path, monkeypatch):
     lifecycle.dispatch_db(db, 60, now=165)
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT count(*) FROM notification_sessions").fetchone()[0] == 0
+
+
+def test_unknown_leading_post_is_not_replayed(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades_44444444.db")
+    sent = []
+
+    def post(url, embed):
+        sent.append(embed["title"])
+        if len(sent) == 1:
+            return "unknown", None, 0
+        return "ok", "999", 0
+
+    monkeypatch.setattr(lifecycle, "_post", post)
+    monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
+    lifecycle.enqueue(db, trade(), None, ["one"], now=100)
+    lifecycle.dispatch_db(db, 60, now=101)
+    assert sent == ["📈 BTC Open Long"]
+    lifecycle.dispatch_db(db, 60, now=105)
+    assert len(sent) == 1
+    lifecycle.dispatch_db(db, 60, now=160)
+    assert len(sent) == 2
+    assert "変更完了" in sent[-1]
+
+
+def test_patch_missing_restarts_leading_message(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades_55555555.db")
+    sent = []
+    monkeypatch.setattr(lifecycle, "_post", lambda url, embed: (
+        sent.append(embed["title"]) or "ok", str(len(sent)), 0
+    ))
+    monkeypatch.setattr(lifecycle, "_patch", lambda *_: ("missing", 0))
+    monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
+    lifecycle.enqueue(db, trade(), None, ["one"], now=100)
+    lifecycle.dispatch_db(db, 60, now=101)
+    lifecycle.enqueue(db, trade("Close Long", "tx-2"), None, ["one"], now=110)
+    lifecycle.dispatch_db(db, 60, now=111)
+    lifecycle.dispatch_db(db, 60, now=112)
+    assert len(sent) == 2
+    assert "更新中" in sent[-1]
