@@ -40,21 +40,33 @@ def ensure_schema(conn):
     """)
 
 
-def _fill_snapshot(trade):
+def _fill_snapshot(trade, ghost_url=None):
+    # Ordinary perp markets use USDC. HIP-3 collateral is resolved by the
+    # caller using Hyperliquid metadata and must not be guessed here.
+    if ghost_url is None and ":" not in trade.coin:
+        ghost_url = (
+            f"https://app.hyperliquid.xyz/trade/{trade.coin}/USDC"
+            f"?hloa={trade.address}"
+        )
     return {
         "address": trade.address, "coin": trade.coin,
         "direction": trade.direction, "price": trade.price,
         "size": trade.size, "tx_hash": trade.tx_hash,
         "timestamp": trade.timestamp.isoformat() if trade.timestamp else "",
+        "ghost_url": ghost_url,
     }
 
 
-def enqueue(db_path, trade, tag, webhook_urls, first_embed=None, now=None, trade_uid=None):
+def enqueue(
+    db_path, trade, tag, webhook_urls, first_embed=None, now=None,
+    trade_uid=None, ghost_url=None,
+):
     """Persist a new fill for each target. Caller already deduplicated the fill."""
     now = time.time() if now is None else now
-    snapshot = json.dumps(_fill_snapshot(trade), ensure_ascii=False)
+    snapshot_data = _fill_snapshot(trade, ghost_url=ghost_url)
+    snapshot = json.dumps(snapshot_data, ensure_ascii=False)
     if first_embed is None:
-        first_embed = _initial_embed(trade, tag)
+        first_embed = _initial_embed(trade, tag, snapshot_data["ghost_url"])
     with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
         ensure_schema(conn)
         if trade_uid is not None:
@@ -89,8 +101,10 @@ def enqueue(db_path, trade, tag, webhook_urls, first_embed=None, now=None, trade
     return True
 
 
-def _initial_embed(trade, tag):
+def _initial_embed(trade, tag, ghost_url=None):
     direction = trade.direction or "Unknown"
+    if ghost_url is None:
+        ghost_url = _fill_snapshot(trade)["ghost_url"]
     marker = "📈" if "Long" in direction else "📉"
     title = f"{marker} {trade.coin} {direction}"
     if tag:
@@ -103,6 +117,7 @@ def _initial_embed(trade, tag):
             f"Price: {trade.price}\n"
             f"Direction: {direction}\n"
             f"Address: https://hypurrscan.io/address/{trade.address}"
+            + (f"\nGhost: {ghost_url}" if ghost_url else "")
         ),
         "color": 0x00FF00 if "Long" in direction else 0xFF0000,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -135,6 +150,7 @@ def _session_embed(row, final=False):
         f"最終約定価格: {fill.get('price')}\n"
         f"最終約定サイズ: {fill.get('size')}\n"
         f"Address: https://hypurrscan.io/address/{fill.get('address')}"
+        + (f"\nGhost: {fill['ghost_url']}" if fill.get("ghost_url") else "")
     )
     return {
         "title": title,
