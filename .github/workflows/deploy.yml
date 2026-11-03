@@ -51,7 +51,7 @@ jobs:
                   if any(".env" in part.lower() for part in pathlib.PurePosixPath(member.name).parts):
                       raise SystemExit("Environment-like path found in deployment artifact; upload blocked")
           PYTHON
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         id: upload
         with:
           name: gce-deployment-${{ github.run_id }}-${{ github.run_attempt }}
