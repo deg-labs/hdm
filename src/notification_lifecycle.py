@@ -277,6 +277,49 @@ def _update(db_path, row, changes):
         )
 
 
+def _remember_final_post(db_path, row, message_id):
+    """Save the final POST result before attempting to edit the original."""
+    with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
+        updated = conn.execute("""
+            UPDATE notification_sessions
+            SET final_message_id=?, next_attempt_at=0
+            WHERE coin=? AND webhook_url=? AND message_id IS ?
+              AND event_count=? AND last_event_at=?
+              AND final_message_id IS NULL
+        """, (
+            message_id, row["coin"], row["webhook_url"], row["message_id"],
+            row["event_count"], row["last_event_at"],
+        ))
+        return updated.rowcount == 1
+
+
+def _complete_original(db_path, row, final_message_id, now):
+    """Mark the original PATCH stream complete, then retire the session.
+
+    Retrying a failed PATCH must never send another final POST.
+    """
+    if row["message_id"] and row["message_id"] != "__unknown__":
+        outcome, delay = _patch(
+            row["webhook_url"], row["message_id"],
+            _session_embed(row, completed=True),
+        )
+    else:
+        outcome, delay = "missing", 0
+
+    if outcome in ("ok", "missing"):
+        with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
+            conn.execute("""
+                DELETE FROM notification_sessions
+                WHERE coin=? AND webhook_url=? AND message_id IS ?
+                  AND final_message_id=? AND event_count=? AND last_event_at=?
+            """, (
+                row["coin"], row["webhook_url"], row["message_id"],
+                final_message_id, row["event_count"], row["last_event_at"],
+            ))
+    else:
+        _update(db_path, row, {"next_attempt_at": now + max(1, delay)})
+
+
 def dispatch_db(db_path, quiet_seconds, now=None):
     """Perform one delivery sweep outside the WebSocket callback."""
     now = time.time() if now is None else now
@@ -285,6 +328,10 @@ def dispatch_db(db_path, quiet_seconds, now=None):
         rows = _load_due(conn, now)
     for row in rows:
         webhook = row["webhook_url"]
+        if row["final_message_id"] is not None:
+            _complete_original(db_path, row, row["final_message_id"], now)
+            continue
+
         if not row["message_id"]:
             outcome, message_id, delay = _post(webhook, json.loads(row["first_embed"]))
             if outcome == "ok":
@@ -325,19 +372,15 @@ def dispatch_db(db_path, quiet_seconds, now=None):
         outcome, message_id, delay = _post(webhook, _session_embed(row, final=True))
         if outcome == "ok":
             _persist_message(db_path, message_id, webhook)
-            with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
-                # A new fill arriving during POST leaves the session open.
-                conn.execute("""
-                    DELETE FROM notification_sessions
-                    WHERE coin=? AND webhook_url=?
-                      AND message_id=? AND event_count=?
-                      AND last_event_at=?
-                """, (row["coin"], webhook, row["message_id"],
-                      row["event_count"], row["last_event_at"]))
+            if _remember_final_post(db_path, row, message_id):
+                _complete_original(db_path, row, message_id, now)
         elif outcome == "retry":
             _update(db_path, row, {"next_attempt_at": now + max(1, delay)})
         else:
-            _update(db_path, row, {"next_attempt_at": now + 300})
+            # We cannot know whether Discord accepted the final POST. Do not
+            # retry blindly, but do complete the original message.
+            if _remember_final_post(db_path, row, "__unknown__"):
+                _complete_original(db_path, row, "__unknown__", now)
 
 
 def dispatch_all(db_directory, quiet_seconds):
