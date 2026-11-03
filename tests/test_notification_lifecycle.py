@@ -145,3 +145,86 @@ def test_trade_and_notification_are_one_transaction(tmp_path):
         assert conn.execute("SELECT count(*) FROM trades").fetchone()[0] == 1
         count = conn.execute("SELECT event_count FROM notification_sessions").fetchone()[0]
         assert count == 1
+
+
+def test_ghost_link_present_in_initial_patch_and_final(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades_77777777.db")
+    entry = trade()
+    entry.coin = "xyz:BTC"
+    # HIP-3 must preserve the metadata-resolved collateral rather than USDC.
+    ghost = (
+        f"https://app.hyperliquid.xyz/trade/xyz:BTC/USDT"
+        f"?hloa={entry.address}"
+    )
+    original_embed = {
+        "title": "📈 Open Long",
+        "description": f"Coin: xyz:BTC\\nGhost: {ghost}",
+    }
+    posted, patched = [], []
+
+    def post(url, embed):
+        posted.append(embed)
+        return "ok", str(len(posted)), 0
+
+    def patch(url, message_id, embed):
+        patched.append(embed)
+        return "ok", 0
+
+    monkeypatch.setattr(lifecycle, "_post", post)
+    monkeypatch.setattr(lifecycle, "_patch", patch)
+    monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
+
+    lifecycle.enqueue(
+        db, entry, "test", ["webhook-a"], first_embed=original_embed,
+        ghost_url=ghost, now=100,
+    )
+    lifecycle.dispatch_db(db, 60, now=101)
+    assert f"Ghost: {ghost}" in posted[0]["description"]
+
+    more = trade("Close Long", "tx-2")
+    more.coin = entry.coin
+    lifecycle.enqueue(
+        db, more, "test", ["webhook-a"],
+        ghost_url=ghost, now=110,
+    )
+    lifecycle.dispatch_db(db, 60, now=111)
+    assert f"Ghost: {ghost}" in patched[0]["description"]
+
+    lifecycle.dispatch_db(db, 60, now=170)
+    assert f"Ghost: {ghost}" in posted[-1]["description"]
+    assert "変更完了" in posted[-1]["title"]
+
+
+def test_regular_market_ghost_url_fallback(tmp_path):
+    db = str(tmp_path / "trades_88888888.db")
+    entry = trade()
+    lifecycle.enqueue(db, entry, None, ["webhook-a"], now=100)
+    with sqlite3.connect(db) as conn:
+        first_embed, latest_fill = conn.execute(
+            "SELECT first_embed, latest_fill FROM notification_sessions"
+        ).fetchone()
+
+    import json
+    expected = (
+        f"https://app.hyperliquid.xyz/trade/BTC/USDC"
+        f"?hloa={entry.address}"
+    )
+    assert f"Ghost: {expected}" in json.loads(first_embed)["description"]
+    assert json.loads(latest_fill)["ghost_url"] == expected
+
+
+def test_hip3_ghost_url_respects_collateral_metadata(monkeypatch):
+    from src import cli_app
+    queried = []
+    def resolve(dex):
+        queried.append(dex)
+        return "USDT"
+    monkeypatch.setattr(cli_app, "get_collateral_ticker_for_dex", resolve)
+    entry = trade()
+    entry.coin = "xyz:BTC"
+    expected = (
+        f"https://app.hyperliquid.xyz/trade/xyz:BTC/USDT"
+        f"?hloa={entry.address}"
+    )
+    assert cli_app.build_ghost_url(entry) == expected
+    assert queried == ["xyz"]
