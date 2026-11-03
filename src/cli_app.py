@@ -448,14 +448,21 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         processed_trades.add(trade_key)
         return
 
-    if not record_trade_in_db(db_path, trade):
-        logger.error("failed to persist fill before notification tx=%s", trade.tx_hash)
+    if not trade.tx_hash:
+        logger.error("cannot track fill without tx hash address_suffix=%s", trade.address[-8:])
+        return
+    try:
+        inserted = lifecycle.enqueue(
+            db_path, trade, tag,
+            (webhook_url, specific_webhook_url),
+            trade_uid=trade_key,
+        )
+    except sqlite3.Error:
+        logger.exception("failed to persist fill and notification session tx=%s", trade.tx_hash)
         return
     processed_trades.add(trade_key)
-    lifecycle.enqueue(
-        db_path, trade, tag,
-        (webhook_url, specific_webhook_url),
-    )
+    if not inserted:
+        return
     logger.debug(
         "notification session updated address_suffix=%s coin=%s tx=%s",
         trade.address[-8:], trade.coin, trade.tx_hash,
