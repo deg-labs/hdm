@@ -33,6 +33,7 @@ def ensure_schema(conn):
             event_count INTEGER NOT NULL,
             updated_count INTEGER NOT NULL DEFAULT 0,
             message_id TEXT,
+            channel_id TEXT,
             weighted_price_sum REAL,
             filled_size REAL,
             last_event_at REAL NOT NULL,
@@ -55,6 +56,7 @@ def ensure_schema(conn):
     for name, sql_type in (
         ("weighted_price_sum", "REAL"),
         ("filled_size", "REAL"),
+        ("channel_id", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE notification_sessions ADD COLUMN {name} {sql_type}")
@@ -131,6 +133,11 @@ def enqueue(
     return True
 
 
+def _direction_color(direction):
+    """Keep direction color consistent across initial, live and finished cards."""
+    return 0x00FF00 if "Long" in direction else 0x0099FF
+
+
 def _initial_embed(trade, tag, ghost_url=None):
     direction = trade.direction or "Unknown"
     if ghost_url is None:
@@ -149,7 +156,7 @@ def _initial_embed(trade, tag, ghost_url=None):
             f"Address: https://hypurrscan.io/address/{trade.address}"
             + (f"\nGhost: {ghost_url}" if ghost_url else "")
         ),
-        "color": 0x00FF00 if "Long" in direction else 0xFF0000,
+        "color": _direction_color(direction),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer": {"text": f"Tx: {trade.tx_hash}"},
     }
@@ -168,7 +175,18 @@ def active_message_ids(conn):
     }
 
 
-def _session_embed(row, final=False, completed=False):
+def _origin_message_link(row, channel_id=None):
+    """Use the actual Discord channel ID, never the webhook ID."""
+    channel_id = channel_id or row["channel_id"]
+    message_id = row["message_id"]
+    if not channel_id or not message_id:
+        return None
+    if not str(channel_id).isdigit() or not str(message_id).isdigit():
+        return None
+    return f"https://discord.com/channels/@me/{channel_id}/{message_id}"
+
+
+def _session_embed(row, final=False, completed=False, channel_id=None):
     fill = json.loads(row["latest_fill"])
     direction = fill.get("direction") or "Unknown"
     coin = fill.get("coin") or row["coin"]
@@ -190,6 +208,7 @@ def _session_embed(row, final=False, completed=False):
         else:
             average = format(weighted_sum / size, ".12g")
         price_line = f"平均約定価格: {average}"
+    origin_link = _origin_message_link(row, channel_id) if final else None
     description = (
         f"約定数: {row['event_count']}回\n"
         f"最新方向: {direction}\n"
@@ -197,18 +216,19 @@ def _session_embed(row, final=False, completed=False):
         f"最終約定サイズ: {fill.get('size')}\n"
         f"Address: https://hypurrscan.io/address/{fill.get('address')}"
         + (f"\nGhost: {fill['ghost_url']}" if fill.get("ghost_url") else "")
+        + (f"\n投稿元: [更新していた投稿]({origin_link})" if origin_link else "")
     )
     return {
         "title": title,
         "description": description,
-        "color": 0x2ECC71 if final or completed else 0x3498DB,
+        "color": _direction_color(direction),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer": {"text": f"Latest Tx: {fill.get('tx_hash') or 'N/A'}"},
     }
 
 
 def _post(webhook, embed):
-    """Return (outcome, message_id, retry_delay); ambiguous POSTs are logged."""
+    """Return (outcome, message_id, retry_delay, channel_id)."""
     try:
         response = requests.post(
             retention.post_url(webhook),
@@ -217,16 +237,20 @@ def _post(webhook, embed):
             timeout=10,
         )
         if response.status_code == 429:
-            return "retry", None, retention.retry_delay(response.json())
+            return "retry", None, retention.retry_delay(response.json()), None
         if response.status_code >= 500:
-            return "retry", None, 10.0
+            return "retry", None, 10.0, None
         response.raise_for_status()
         payload = response.json()
         message_id = payload.get("id") if isinstance(payload, dict) else None
         if not message_id:
             logger.error("Discord POST returned no message ID")
-            return "unknown", None, 0
-        return "ok", str(message_id), 0
+            return "unknown", None, 0, None
+        channel_id = payload.get("channel_id")
+        return (
+            "ok", str(message_id), 0,
+            str(channel_id) if channel_id and str(channel_id).isdigit() else None,
+        )
     except requests.exceptions.ConnectTimeout:
         return "retry", None, 10.0
     except (requests.exceptions.RequestException, ValueError, TypeError) as error:
@@ -259,6 +283,22 @@ def _patch(webhook, message_id, embed):
     except (requests.exceptions.RequestException, ValueError, TypeError) as error:
         logger.warning("Discord PATCH failed error_type=%s", type(error).__name__)
         return "retry", 10.0
+
+
+def _recover_original_channel_id(webhook, message_id):
+    """Recover metadata for sessions created before channel_id was stored."""
+    if not retention.webhook_id(webhook) or not str(message_id).isdigit():
+        return None
+    try:
+        response = requests.get(retention.message_url(webhook, message_id), timeout=10)
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        channel_id = payload.get("channel_id") if isinstance(payload, dict) else None
+        return str(channel_id) if channel_id and str(channel_id).isdigit() else None
+    except (requests.exceptions.RequestException, ValueError, TypeError):
+        logger.warning("Could not resolve original Discord channel ID")
+        return None
 
 
 def _persist_message(db_path, message_id, webhook_url):
@@ -361,10 +401,11 @@ def dispatch_db(db_path, quiet_seconds, now=None):
     for row in rows:
         webhook = row["webhook_url"]
         if not row["message_id"]:
-            outcome, message_id, delay = _post(webhook, json.loads(row["first_embed"]))
+            outcome, message_id, delay, channel_id = _post(webhook, json.loads(row["first_embed"]))
             if outcome == "ok":
                 _persist_message(db_path, message_id, webhook)
                 _update(db_path, row, {"message_id": message_id,
+                                       "channel_id": channel_id,
                                        "updated_count": 1, "next_attempt_at": 0})
             elif outcome == "retry":
                 _update(db_path, row, {"next_attempt_at": now + max(1, delay)})
@@ -389,6 +430,7 @@ def dispatch_db(db_path, quiet_seconds, now=None):
                 # The leading message could have been manually removed.
                 _update(db_path, row, {"message_id": None,
                                        "first_embed": json.dumps(_session_embed(row)),
+                                       "channel_id": None,
                                        "next_attempt_at": 0})
             else:
                 _update(db_path, row, {"next_attempt_at": now + max(1, delay)})
@@ -397,7 +439,16 @@ def dispatch_db(db_path, quiet_seconds, now=None):
         if now - row["last_event_at"] < quiet_seconds:
             continue
 
-        outcome, message_id, delay = _post(webhook, _session_embed(row, final=True))
+        # The initial POST supplies channel_id for new sessions. Existing rows
+        # can recover it from the original webhook message without a bot token.
+        channel_id = row["channel_id"]
+        if not channel_id and row["message_id"] != "__unknown__":
+            channel_id = _recover_original_channel_id(webhook, row["message_id"])
+            if channel_id:
+                _update(db_path, row, {"channel_id": channel_id})
+        outcome, message_id, delay, _ = _post(
+            webhook, _session_embed(row, final=True, channel_id=channel_id),
+        )
         if outcome == "ok":
             _persist_message(db_path, message_id, webhook)
             _queue_completed_update(db_path, row)
