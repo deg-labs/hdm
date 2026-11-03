@@ -438,7 +438,6 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     if trade.direction not in allowed_directions:
         return
 
-    touch_healthcheck_file()
     trade_key = make_trade_uid(trade)
     if trade_key in processed_trades:
         return
@@ -792,6 +791,14 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
     """複数アドレスを単一 WebSocket 接続で監視し、切断時に自動再接続する"""
     global monitor_instances
 
+    # A restart must not inherit a stale heartbeat from a previous process.
+    try:
+        os.unlink(HEALTHCHECK_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        logger.warning("failed to clear previous healthcheck heartbeat error=%s", error)
+
     address_state = {}
     for address, info in addresses.items():
         db_path = os.path.join(DB_DIRECTORY, f"trades_{address[-8:]}.db")
@@ -910,6 +917,8 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
                         monitor.stop()
                     break
 
+                # Health reflects the monitor loop, not whether a wallet traded.
+                touch_healthcheck_file()
                 await asyncio.sleep(10)
 
             if shutdown_requested.is_set():
