@@ -455,7 +455,6 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
     lifecycle.enqueue(
         db_path, trade, tag,
         (webhook_url, specific_webhook_url),
-        build_trade_embed(trade, tag),
     )
     logger.debug(
         "notification session updated address_suffix=%s coin=%s tx=%s",
