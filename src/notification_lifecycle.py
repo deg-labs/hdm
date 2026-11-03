@@ -33,11 +33,24 @@ def ensure_schema(conn):
             event_count INTEGER NOT NULL,
             updated_count INTEGER NOT NULL DEFAULT 0,
             message_id TEXT,
+            final_message_id TEXT,
+            weighted_price_sum REAL,
+            filled_size REAL,
             last_event_at REAL NOT NULL,
             next_attempt_at REAL NOT NULL DEFAULT 0,
             PRIMARY KEY (coin, webhook_url)
         )
     """)
+    # Existing live sessions cannot reconstruct a historical weighted average
+    # from their stored last fill. Leave it unknown until the next session.
+    columns = {column[1] for column in conn.execute("PRAGMA table_info(notification_sessions)")}
+    for name, sql_type in (
+        ("final_message_id", "TEXT"),
+        ("weighted_price_sum", "REAL"),
+        ("filled_size", "REAL"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE notification_sessions ADD COLUMN {name} {sql_type}")
 
 
 def _fill_snapshot(trade, ghost_url=None):
@@ -65,6 +78,8 @@ def enqueue(
     now = time.time() if now is None else now
     snapshot_data = _fill_snapshot(trade, ghost_url=ghost_url)
     snapshot = json.dumps(snapshot_data, ensure_ascii=False)
+    filled_size = abs(float(trade.size))
+    weighted_price_sum = filled_size * float(trade.price)
     if first_embed is None:
         first_embed = _initial_embed(trade, tag, snapshot_data["ghost_url"])
     with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
@@ -86,17 +101,25 @@ def enqueue(
             conn.execute("""
                 INSERT INTO notification_sessions
                     (coin, webhook_url, first_embed, latest_fill, tag,
-                     event_count, last_event_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?)
+                     event_count, last_event_at, weighted_price_sum, filled_size)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
                 ON CONFLICT(coin, webhook_url) DO UPDATE SET
                     latest_fill=excluded.latest_fill,
                     tag=excluded.tag,
                     event_count=notification_sessions.event_count + 1,
-                    last_event_at=excluded.last_event_at
+                    last_event_at=excluded.last_event_at,
+                    weighted_price_sum=CASE
+                        WHEN notification_sessions.weighted_price_sum IS NULL THEN NULL
+                        ELSE notification_sessions.weighted_price_sum + excluded.weighted_price_sum
+                    END,
+                    filled_size=CASE
+                        WHEN notification_sessions.filled_size IS NULL THEN NULL
+                        ELSE notification_sessions.filled_size + excluded.filled_size
+                    END
             """, (
                 trade.coin, webhook_url,
                 json.dumps(first_embed, ensure_ascii=False), snapshot,
-                tag, now,
+                tag, now, weighted_price_sum, filled_size,
             ))
     return True
 
@@ -135,19 +158,32 @@ def active_message_ids(conn):
     }
 
 
-def _session_embed(row, final=False):
+def _session_embed(row, final=False, completed=False):
     fill = json.loads(row["latest_fill"])
     direction = fill.get("direction") or "Unknown"
     coin = fill.get("coin") or row["coin"]
-    marker = "✅" if final else "📈" if "Long" in direction else "📉"
-    suffix = "ポジション変更完了" if final else "更新中"
+    marker = "✅" if final or completed else "📈" if "Long" in direction else "📉"
+    suffix = "ポジション変更完了" if final else "更新完了" if completed else "更新中"
     title = f"{marker} {coin} {suffix}"
     if row["tag"]:
         title += f" (Tag: {row['tag']})"
+    if final:
+        # Keep the separate final POST format unchanged.
+        price_line = f"最終約定価格: {fill.get('price')}"
+    else:
+        size = row["filled_size"]
+        weighted_sum = row["weighted_price_sum"]
+        if size is None or weighted_sum is None:
+            average = "集計不可（更新前の約定履歴が不足）"
+        elif size <= 0:
+            average = "集計不可（約定サイズ0）"
+        else:
+            average = format(weighted_sum / size, ".12g")
+        price_line = f"平均約定価格: {average}"
     description = (
         f"約定数: {row['event_count']}回\n"
         f"最新方向: {direction}\n"
-        f"最終約定価格: {fill.get('price')}\n"
+        f"{price_line}\n"
         f"最終約定サイズ: {fill.get('size')}\n"
         f"Address: https://hypurrscan.io/address/{fill.get('address')}"
         + (f"\nGhost: {fill['ghost_url']}" if fill.get("ghost_url") else "")
@@ -155,7 +191,7 @@ def _session_embed(row, final=False):
     return {
         "title": title,
         "description": description,
-        "color": 0x2ECC71 if final else 0x3498DB,
+        "color": 0x2ECC71 if final or completed else 0x3498DB,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "footer": {"text": f"Latest Tx: {fill.get('tx_hash') or 'N/A'}"},
     }
