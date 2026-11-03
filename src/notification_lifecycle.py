@@ -49,7 +49,7 @@ def _fill_snapshot(trade):
     }
 
 
-def enqueue(db_path, trade, tag, webhook_urls, first_embed=None, now=None):
+def enqueue(db_path, trade, tag, webhook_urls, first_embed=None, now=None, trade_uid=None):
     """Persist a new fill for each target. Caller already deduplicated the fill."""
     now = time.time() if now is None else now
     snapshot = json.dumps(_fill_snapshot(trade), ensure_ascii=False)
@@ -57,6 +57,19 @@ def enqueue(db_path, trade, tag, webhook_urls, first_embed=None, now=None):
         first_embed = _initial_embed(trade, tag)
     with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
         ensure_schema(conn)
+        if trade_uid is not None:
+            inserted = conn.execute("""
+                INSERT OR IGNORE INTO trades
+                    (trade_uid, tx_hash, address, coin, direction, timestamp, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade_uid, trade.tx_hash, trade.address, trade.coin,
+                trade.direction,
+                trade.timestamp.isoformat() if trade.timestamp else None,
+                int(now),
+            ))
+            if inserted.rowcount == 0:
+                return False
         for webhook_url in dict.fromkeys(url for url in webhook_urls if url):
             conn.execute("""
                 INSERT INTO notification_sessions
@@ -73,6 +86,7 @@ def enqueue(db_path, trade, tag, webhook_urls, first_embed=None, now=None):
                 json.dumps(first_embed, ensure_ascii=False), snapshot,
                 tag, now,
             ))
+    return True
 
 
 def _initial_embed(trade, tag):
