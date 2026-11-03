@@ -12,6 +12,7 @@ import logging
 import sqlite3
 import time
 from datetime import datetime, timezone
+from contextlib import closing
 from pathlib import Path
 
 import requests
@@ -48,11 +49,13 @@ def _fill_snapshot(trade):
     }
 
 
-def enqueue(db_path, trade, tag, webhook_urls, first_embed, now=None):
+def enqueue(db_path, trade, tag, webhook_urls, first_embed=None, now=None):
     """Persist a new fill for each target. Caller already deduplicated the fill."""
     now = time.time() if now is None else now
     snapshot = json.dumps(_fill_snapshot(trade), ensure_ascii=False)
-    with sqlite3.connect(db_path, timeout=10) as conn:
+    if first_embed is None:
+        first_embed = _initial_embed(trade, tag)
+    with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
         ensure_schema(conn)
         for webhook_url in dict.fromkeys(url for url in webhook_urls if url):
             conn.execute("""
@@ -72,12 +75,33 @@ def enqueue(db_path, trade, tag, webhook_urls, first_embed, now=None):
             ))
 
 
+def _initial_embed(trade, tag):
+    direction = trade.direction or "Unknown"
+    marker = "📈" if "Long" in direction else "📉"
+    title = f"{marker} {trade.coin} {direction}"
+    if tag:
+        title += f" (Tag: {tag})"
+    return {
+        "title": title,
+        "description": (
+            f"最初のエントリーを検知\\n"
+            f"Coin: {trade.coin}\\n"
+            f"Price: {trade.price}\\n"
+            f"Direction: {direction}\\n"
+            f"Address: https://hypurrscan.io/address/{trade.address}"
+        ),
+        "color": 0x00FF00 if "Long" in direction else 0xFF0000,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {"text": f"Tx: {trade.tx_hash}"},
+    }
+
+
 def active_message_ids(conn):
     """Do not delete active leading POSTs during Discord retention sweeps."""
     ensure_schema(conn)
     return {
         row[0] for row in conn.execute(
-            "SELECT message_id FROM notification_sessions WHERE message_id IS NOT NULL"
+            "SELECT message_id FROM notification_sessions WHERE message_id IS NOT NULL AND message_id != '__unknown__'"
         )
     }
 
@@ -177,7 +201,7 @@ def _load_due(conn, now):
 
 def _update(db_path, row, changes):
     columns = ", ".join(f"{column}=?" for column in changes)
-    with sqlite3.connect(db_path, timeout=10) as conn:
+    with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
         # New events may increase event_count concurrently, so never overwrite
         # latest_fill or event_count after a network operation.
         conn.execute(
@@ -190,7 +214,7 @@ def _update(db_path, row, changes):
 def dispatch_db(db_path, quiet_seconds, now=None):
     """Perform one delivery sweep outside the WebSocket callback."""
     now = time.time() if now is None else now
-    with sqlite3.connect(db_path, timeout=10) as conn:
+    with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
         ensure_schema(conn)
         rows = _load_due(conn, now)
     for row in rows:
@@ -204,12 +228,18 @@ def dispatch_db(db_path, quiet_seconds, now=None):
             elif outcome == "retry":
                 _update(db_path, row, {"next_attempt_at": now + max(1, delay)})
             else:
-                # The response might have been lost after Discord accepted it.
-                # Delay uncertain retries rather than flooding on each tick.
-                _update(db_path, row, {"next_attempt_at": now + 300})
+                # A timed-out leading POST may have succeeded: never POST it again.
+                # Keep the last fill to deliver a final POST after the quiet window.
+                _update(db_path, row, {"message_id": "__unknown__",
+                                       "updated_count": row["event_count"]})
             continue
 
-        if row["updated_count"] < row["event_count"]:
+        if row["message_id"] == "__unknown__":
+            if now - row["last_event_at"] < quiet_seconds:
+                continue
+            # No confirmed message ID to edit. A trailing POST is the only
+            # possible recovery and can be duplicated if its response is lost.
+        elif row["updated_count"] < row["event_count"]:
             outcome, delay = _patch(webhook, row["message_id"], _session_embed(row))
             if outcome == "ok":
                 _update(db_path, row, {"updated_count": row["event_count"],
@@ -229,7 +259,7 @@ def dispatch_db(db_path, quiet_seconds, now=None):
         outcome, message_id, delay = _post(webhook, _session_embed(row, final=True))
         if outcome == "ok":
             _persist_message(db_path, message_id, webhook)
-            with sqlite3.connect(db_path, timeout=10) as conn:
+            with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
                 # A new fill arriving during POST leaves the session open.
                 conn.execute("""
                     DELETE FROM notification_sessions
