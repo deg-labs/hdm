@@ -369,7 +369,17 @@ def get_collateral_ticker_for_dex(dex: str) -> str:
     collateral_ticker_cache[dex] = ticker
     return ticker
 
-def build_trade_embed(trade: Trade, tag: str):
+def build_ghost_url(trade: Trade) -> str:
+    """Use the original Hyperliquid Ghost URL, including HIP-3 collateral."""
+    dex = trade.coin.split(":", 1)[0] if trade.coin and ":" in trade.coin else ""
+    collateral_ticker = get_collateral_ticker_for_dex(dex)
+    return (
+        f"https://app.hyperliquid.xyz/trade/{trade.coin}/{collateral_ticker}"
+        f"?hloa={trade.address}"
+    )
+
+
+def build_trade_embed(trade: Trade, tag: str, ghost_url: str = None):
     direction = trade.direction or ""
     # Determine Color and Title based on trade
     color = 0x0099ff # Blue default
@@ -402,8 +412,8 @@ def build_trade_embed(trade: Trade, tag: str):
     if trade.trade_type == "FILL":
         address_parts_text.append("ポジションに変更があったよ！")
 
-    dex = trade.coin.split(":", 1)[0] if trade.coin and ":" in trade.coin else ""
-    collateral_ticker = get_collateral_ticker_for_dex(dex)
+    if ghost_url is None:
+        ghost_url = build_ghost_url(trade)
 
     address_block_text = "\n".join(address_parts_text)
 
@@ -416,7 +426,7 @@ Price: {trade.price}
 Direction: {display_direction}
 
 Address: https://hypurrscan.io/address/{trade.address}
-Ghost: https://app.hyperliquid.xyz/trade/{trade.coin}/{collateral_ticker}?hloa={trade.address}"""
+Ghost: {ghost_url}"""
 
     return {
         "title": title,
@@ -451,10 +461,13 @@ def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str
         logger.error("cannot track fill without tx hash address_suffix=%s", trade.address[-8:])
         return
     try:
+        ghost_url = build_ghost_url(trade)
         inserted = lifecycle.enqueue(
             db_path, trade, tag,
             (webhook_url, specific_webhook_url),
+            first_embed=build_trade_embed(trade, tag, ghost_url=ghost_url),
             trade_uid=trade_key,
+            ghost_url=ghost_url,
         )
     except sqlite3.Error:
         logger.exception("failed to persist fill and notification session tx=%s", trade.tx_hash)
