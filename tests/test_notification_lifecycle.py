@@ -301,10 +301,11 @@ def test_completed_patch_retry_never_reposts_final(tmp_path, monkeypatch):
     lifecycle.dispatch_db(db, 60, now=160)
     assert len(posted) == 2
     with sqlite3.connect(db) as conn:
-        final_id, next_attempt = conn.execute(
-            "SELECT final_message_id, next_attempt_at FROM notification_sessions"
+        assert conn.execute("SELECT count(*) FROM notification_sessions").fetchone()[0] == 0
+        message_id, next_attempt = conn.execute(
+            "SELECT message_id, next_attempt_at FROM notification_completions"
         ).fetchone()
-        assert final_id == "2"
+        assert message_id == "1"
         assert next_attempt == 165
 
     # Simulate a process restart; only the original PATCH should be retried.
@@ -313,7 +314,7 @@ def test_completed_patch_retry_never_reposts_final(tmp_path, monkeypatch):
     assert len(patched) == 2
     assert "更新完了" in patched[-1]["title"]
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT count(*) FROM notification_sessions").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM notification_completions").fetchone()[0] == 0
 
 
 def test_existing_session_migrates_without_fabricated_average(tmp_path):
@@ -345,3 +346,48 @@ def test_existing_session_migrates_without_fabricated_average(tmp_path):
         assert "集計不可" in embed["description"]
         assert "更新完了" in embed["title"]
         assert "最終約定価格: 130" in lifecycle._session_embed(row, final=True)["description"]
+
+
+
+def test_new_fill_creates_new_session_while_completed_patch_is_queued(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades_new_after_final.db")
+    posted = []
+    patches = []
+
+    def post(url, embed):
+        posted.append(embed)
+        return "ok", str(len(posted)), 0
+
+    def patch(url, msg_id, embed):
+        patches.append((msg_id, embed))
+        if len(patches) == 1:
+            return "retry", 30
+        return "ok", 0
+
+    monkeypatch.setattr(lifecycle, "_post", post)
+    monkeypatch.setattr(lifecycle, "_patch", patch)
+    monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
+
+    lifecycle.enqueue(db, trade(), None, ["one"], now=100)
+    lifecycle.dispatch_db(db, 60, now=101)
+    lifecycle.dispatch_db(db, 60, now=160)
+    assert len(posted) == 2
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM notification_completions").fetchone()[0] == 1
+
+    fresh = trade("Open Short", "tx-after-final")
+    lifecycle.enqueue(db, fresh, None, ["one"], now=170)
+    lifecycle.dispatch_db(db, 60, now=171)
+    assert len(posted) == 3
+    assert "Open Short" in posted[-1]["title"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM notification_sessions").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM notification_completions").fetchone()[0] == 1
+
+    lifecycle.dispatch_db(db, 60, now=190)
+    assert patches[-1][0] == "1"
+    assert "更新完了" in patches[-1][1]["title"]
+    assert len(posted) == 3
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM notification_sessions").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM notification_completions").fetchone()[0] == 0
