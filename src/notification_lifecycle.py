@@ -255,7 +255,7 @@ def _post(webhook, embed):
         return "retry", None, 10.0, None
     except (requests.exceptions.RequestException, ValueError, TypeError) as error:
         logger.error("Discord POST outcome uncertain error_type=%s", type(error).__name__)
-        return "unknown", None, 0
+        return "unknown", None, 0, None
 
 
 def _patch(webhook, message_id, embed):
