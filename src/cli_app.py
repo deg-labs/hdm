@@ -393,11 +393,10 @@ def build_trade_embed(trade: Trade, tag: str, ghost_url: str = None):
         title = f"📉 {direction}"
     
     if trade.closed_pnl:
+        # Keep the PnL label, but use the position side for the card color.
         if trade.closed_pnl > 0:
-            color = 0x00ff00
             title = f"🟢 Closed Position (Profit)"
         else:
-            color = 0xff0000
             title = f"🔴 Closed Position (Loss)"
     
     # Append Tag to Title if it exists
