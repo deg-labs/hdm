@@ -129,3 +129,19 @@ def test_patch_missing_restarts_leading_message(tmp_path, monkeypatch):
     lifecycle.dispatch_db(db, 60, now=112)
     assert len(sent) == 2
     assert "更新中" in sent[-1]
+
+
+def test_trade_and_notification_are_one_transaction(tmp_path):
+    db = str(tmp_path / "trades_66666666.db")
+    with sqlite3.connect(db) as conn:
+        conn.execute("""CREATE TABLE trades (
+            trade_uid TEXT UNIQUE, tx_hash TEXT, address TEXT, coin TEXT,
+            direction TEXT, timestamp TEXT, seen_at INTEGER
+        )""")
+    args = (db, trade(), None, ["one"])
+    assert lifecycle.enqueue(*args, now=100, trade_uid="unique-fill") is True
+    assert lifecycle.enqueue(*args, now=120, trade_uid="unique-fill") is False
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM trades").fetchone()[0] == 1
+        count = conn.execute("SELECT event_count FROM notification_sessions").fetchone()[0]
+        assert count == 1
