@@ -3,8 +3,8 @@
 Hyperliquid の `userFills` を監視し、対象取引を Discord Webhook に通知する Python アプリです。
 
 - 複数アドレスを 1 つの WebSocket 接続で監視
-- SQLite による重複通知防止
-- 起動直後の履歴・受信通知の抑制
+- SQLite による約定の重複排除・通知セッションの永続化
+- 初回POST・連続約定のPATCH・静穏後の最終POST
 - アドレスごとのタグ / 個別 Webhook 対応
 - WebSocket 切断・無通信時の自動再接続
 - Docker / Docker Compose 対応
@@ -163,10 +163,10 @@ python hdm.py tests -f addresses.txt --post
 | 変数 | 必須 | 既定値 | 説明 |
 | --- | --- | --- | --- |
 | `DISCORD_WEBHOOK_URL` | monitor では必須 | なし | デフォルト通知先の Webhook URL |
-| `NOTIFICATION_SUPPRESSION_SECONDS` | 任意 | `60` | 同一アドレス・coin・direction・清算種別の通知を抑制する秒数 |
+| `NOTIFICATION_SUPPRESSION_SECONDS` | 任意 | `600` | 最後の約定から最終POSTを行うまでの静穏秒数（通知抑止ではありません） |
 | `USER_FILL_INACTIVITY_RECONNECT_SECONDS` | 任意 | `900` | 監視対象アドレスからuserFillsを受信しない場合に再接続するまでの秒数 |
 | `DB_DIRECTORY` | 任意 | `.` | SQLite DB の保存先 |
-| `HEALTHCHECK_FILE` | 任意 | `/tmp/healthcheck.txt` | 通知対象の fill を処理したときに更新するファイル |
+| `HEALTHCHECK_FILE` | 任意 | `/tmp/healthcheck.txt` | WebSocket監視ループの生存確認用ファイル。取引がなくても監視中は約10秒ごとに更新 |
 | `TEST_PREVIEW_TIMEOUT_SECONDS` | 任意 | `60` | `tests` の待機秒数 |
 | `TEST_PREVIEW_MAX_ENTRIES` | 任意 | `10` | `tests` の最大表示件数 |
 | `LOG_LEVEL` | 任意 | `INFO` | Python logging のログレベル（例: `DEBUG`, `INFO`, `WARNING`, `ERROR`） |
@@ -178,15 +178,35 @@ python hdm.py tests -f addresses.txt --post
 - アドレスごとに `trades_<アドレス末尾8文字>.db` を作成します。
 - 既存の fill は一意な取引 UID と tx hash 等で判定し、再通知しません。
 - 起動時に DB が空の場合、Hyperliquid の `user_fills` 履歴を DB にシードします。シードした履歴は通知しません。
-- WebSocket 接続後 60 秒間は通知を抑制し、再起動直後の履歴再送を防ぎます。
+- 既知の約定UIDはSQLiteで重複排除し、再接続しても再通知しません。
 - 通知対象の direction は次の 4 種類です。
   - `Open Long`
   - `Close Long`
   - `Open Short`
   - `Close Short`
-- Discord 通知に失敗した場合は最大 3 回まで再試行します。
+- 通常監視ではウォレット・coin・Webhookごとに1件の通知セッションを管理します。最初の約定を新規POSTし、続く約定は2秒ごとの送信スイープで同じメッセージをPATCHします（高頻度の約定は最新状態にまとめて更新します）。
+- 最後の約定から `NOTIFICATION_SUPPRESSION_SECONDS` 秒が経過すると、最新方向・総約定数を含む最終メッセージを新規POSTします。その後、元の更新中メッセージをPATCHで `✅ 更新完了` に変更して、約定サイズ加重平均による**平均約定価格**を表示します。カード色は更新中・完了ともに最新方向で統一し、Longは緑、Shortは青です。最終POSTには元のPATCH対象投稿へのリンクも付与します。独立した最終POSTの内容（最終約定価格など）は変更しません。**1件のみの約定でも、静穏後に最終POSTを送ります。**
+- 未完了セッションは既存の `trades_*.db` の `notification_sessions` に保持されます。再起動後もPATCH対象ID・最後の約定時刻が残り、WebSocketイベントなしで最終POSTできます。元の投稿を完了済みに変更するPATCHが失敗した場合は `notification_completions` に保存して再試行し、**最終POSTの重複送信を防ぎます**。新たな約定は新規セッションとして処理します。DBボリュームは必ず永続化してください。
+- Discordの429は `retry_after` で再試行し、5xx/通信失敗は遅延再試行します。POSTの応答が失われた場合には重複が起き得るため、Discord APIだけでは完全なexactly-once配信を保証できません。
+- 通知先が2つある場合はそれぞれ独立したメッセージIDと送信状態を持ちます。進行中の初回メッセージは自動削除処理から保護します。
+- `tests --post` のプレビュー送信は従来どおり単独POSTです。
 
 `docker-compose.yml` は現在 `addresses.txt` のみを bind mount しています。コンテナの再作成後も DB を保持する必要がある場合は、運用環境で `DB_DIRECTORY` と一致する DB 用 bind mount または Docker volume を構成してください。GCE デプロイではデプロイ先の構成も含めて永続化方法を別途確認してください。
+
+### 通知サイクルの例
+
+```text
+10:00  BTC Open Long      → 新規POST（📈 BTC Open Long）
+10:01  BTC 追加エントリー  → 既存メッセージをPATCH（約定数: 2）
+10:02  BTC Close Long     → 既存メッセージをPATCH（約定数: 3、最新方向: Close Long）
+11:02  60分間新規約定なし → 最終状態を新規POST（✅ BTC ポジション変更完了）
+11:02  初回の投稿をPATCH → ✅ BTC 更新完了（集約した平均約定価格を表示）
+      最終POST内に元投稿リンクを追加 → [更新していた投稿](DiscordのメッセージURL)
+```
+
+このリンクはDiscordの初回POST応答に含まれるチャンネルIDとメッセージIDから生成します。旧セッションは元投稿をDiscord APIから取得して補完を試みます。元投稿IDが不明、またはチャンネルIDを取得できない場合には、リンクを省略します。投稿が後から削除された場合、そのリンクは開けなくなることがあります。
+
+上記は `NOTIFICATION_SUPPRESSION_SECONDS=3600` の例です。平均約定価格は `Σ(約定価格 × |約定サイズ|) / Σ|約定サイズ|` で計算します（ロングとショートの約定を含むセッション全体の平均で、ポジション建値とは異なります）。旧セッションで過去の価格・サイズが復元できない場合、平均価格を推定せず集計不可と表示します。これはPATCH送信間隔ではなく静穏判定に使用します。Discordレート制限下で更新を合流させるため、短時間に大量の約定が届いた場合はPATCH 1回にまとめます。
 
 ## Docker 実行
 
@@ -214,7 +234,7 @@ docker compose logs -f
 docker compose down
 ```
 
-`docker-compose.yml` はホストの `addresses.txt` を `/app/addresses.txt` に bind mount します。Dockerfile はビルド時に `.env` もイメージへコピーするため、`.env` の取り扱いとイメージの共有範囲に注意してください。
+`docker-compose.yml` はホストの `addresses.txt` を `/app/addresses.txt` に bind mount し、`.env` は `env_file` として実行時に読み込みます。Dockerfileには `.env` をコピーしません。監視スレッドが正常に動いていれば取引がなくてもヘルスチェック用ハートビートを更新します（30秒間隔で検査、120秒以上更新がない場合は失敗、起動猶予60秒）。
 
 ## リリース / デプロイ方法
 
@@ -257,7 +277,7 @@ GitHub リポジトリの `Settings > Secrets and variables > Actions` に、環
 
 Repository Variables には次を設定できます。
 
-- `NOTIFICATION_SUPPRESSION_SECONDS`（未設定時はデプロイワークフロー側で `3600`）
+- `NOTIFICATION_SUPPRESSION_SECONDS` はローカルでは `.env` から読み込みます。Composeによる上書きはしません。未設定時はアプリ側の既定値 `600` 秒です。現行の共有GCEデプロイワークフローはWebhookなどの最小限の環境変数のみを生成するため、GCE側にもこの値が必要な場合はデプロイ側の環境変数生成方法を拡張してください。
 
 デプロイ時には `.env.template` へ環境別 Webhook と DB 設定を `envsubst` で埋め込み、Secret から生成した `addresses.txt` とともに GCE へ転送します。生成した `.env` はソースアーカイブには含めず、GCE 上の `/opt/apps/hdm/.env` として配置されます。
 
