@@ -389,7 +389,7 @@ def build_trade_embed(trade: Trade, tag: str, ghost_url: str = None):
         color = 0x00ff00 # Green
         title = f"📈 {direction}"
     elif "Short" in direction:
-        color = 0xff0000 # Red
+        color = 0x0099ff # Blue (Short)
         title = f"📉 {direction}"
     
     if trade.closed_pnl:
