@@ -19,7 +19,7 @@ def test_leading_patch_and_trailing(tmp_path, monkeypatch):
 
     def post(url, embed):
         sent.append((url, embed))
-        return "ok", str(len(sent)), 0
+        return "ok", str(len(sent)), 0, "123456789"
 
     def patch(url, message_id, embed):
         edited.append((url, message_id, embed))
@@ -60,7 +60,7 @@ def test_session_survives_restart_and_protects_active_message(tmp_path, monkeypa
 
     def post(url, embed):
         sent.append(url)
-        return "ok", str(len(sent)), 0
+        return "ok", str(len(sent)), 0, "123456789"
 
     monkeypatch.setattr(lifecycle, "_post", post)
     monkeypatch.setattr(lifecycle, "_patch", lambda *_: ("ok", 0))
@@ -79,7 +79,7 @@ def test_session_survives_restart_and_protects_active_message(tmp_path, monkeypa
 
 def test_discord_retry_does_not_lose_last_event(tmp_path, monkeypatch):
     db = str(tmp_path / "trades_33333333.db")
-    responses = iter([("ok", "1", 0), ("retry", None, 5), ("ok", "2", 0)])
+    responses = iter([("ok", "1", 0, "123456789"), ("retry", None, 5, None), ("ok", "2", 0, "123456789")])
     monkeypatch.setattr(lifecycle, "_post", lambda *_: next(responses))
     monkeypatch.setattr(lifecycle, "_patch", lambda *_: ("ok", 0))
     monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
@@ -101,8 +101,8 @@ def test_unknown_leading_post_is_not_replayed(tmp_path, monkeypatch):
     def post(url, embed):
         sent.append(embed["title"])
         if len(sent) == 1:
-            return "unknown", None, 0
-        return "ok", "999", 0
+            return "unknown", None, 0, None
+        return "ok", "999", 0, "123456789"
 
     monkeypatch.setattr(lifecycle, "_post", post)
     monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
@@ -120,7 +120,7 @@ def test_patch_missing_restarts_leading_message(tmp_path, monkeypatch):
     db = str(tmp_path / "trades_55555555.db")
     sent = []
     monkeypatch.setattr(lifecycle, "_post", lambda url, embed: (
-        sent.append(embed["title"]) or "ok", str(len(sent)), 0
+        sent.append(embed["title"]) or "ok", str(len(sent)), 0, "123456789"
     ))
     monkeypatch.setattr(lifecycle, "_patch", lambda *_: ("missing", 0))
     monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
@@ -166,7 +166,7 @@ def test_ghost_link_present_in_initial_patch_and_final(tmp_path, monkeypatch):
 
     def post(url, embed):
         posted.append(embed)
-        return "ok", str(len(posted)), 0
+        return "ok", str(len(posted)), 0, "123456789"
 
     def patch(url, message_id, embed):
         patched.append(embed)
@@ -241,7 +241,7 @@ def test_weighted_average_and_completed_original(tmp_path, monkeypatch):
 
     def post(url, embed):
         posted.append(embed)
-        return "ok", str(len(posted)), 0
+        return "ok", str(len(posted)), 0, "123456789"
 
     def patch(url, msg_id, embed):
         patched.append((msg_id, embed))
@@ -286,7 +286,7 @@ def test_completed_patch_retry_never_reposts_final(tmp_path, monkeypatch):
 
     def post(url, embed):
         posted.append(embed)
-        return "ok", str(len(posted)), 0
+        return "ok", str(len(posted)), 0, "123456789"
 
     def patch(url, msg_id, embed):
         patched.append(embed)
@@ -356,7 +356,7 @@ def test_new_fill_creates_new_session_while_completed_patch_is_queued(tmp_path, 
 
     def post(url, embed):
         posted.append(embed)
-        return "ok", str(len(posted)), 0
+        return "ok", str(len(posted)), 0, "123456789"
 
     def patch(url, msg_id, embed):
         patches.append((msg_id, embed))
@@ -391,3 +391,100 @@ def test_new_fill_creates_new_session_while_completed_patch_is_queued(tmp_path, 
     with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT count(*) FROM notification_sessions").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM notification_completions").fetchone()[0] == 0
+
+
+
+def test_direction_color_stays_green_long_blue_short_when_complete(tmp_path, monkeypatch):
+    """A final POST and the completed original keep the latest side's color."""
+    monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
+    post_embeds, patched = [], []
+
+    def post(url, embed):
+        post_embeds.append((url, embed))
+        # Each destination may point to a different channel.
+        channel_id = "987654321" if url == "long-webhook" else "123456789"
+        return "ok", str(1000 + len(post_embeds)), 0, channel_id
+
+    def patch(url, message_id, embed):
+        patched.append((url, message_id, embed))
+        return "ok", 0
+
+    monkeypatch.setattr(lifecycle, "_post", post)
+    monkeypatch.setattr(lifecycle, "_patch", patch)
+
+    for side, webhook, color in (
+        ("Open Long", "long-webhook", 0x00FF00),
+        ("Open Short", "short-webhook", 0x0099FF),
+    ):
+        db = str(tmp_path / ("trades_" + side.replace(" ", "_") + ".db"))
+        event = trade(side, "tx-" + side)
+        lifecycle.enqueue(db, event, None, [webhook], now=100)
+        lifecycle.dispatch_db(db, 60, now=101)
+        original_id = str(1000 + len(post_embeds))
+        assert post_embeds[-1][1]["color"] == color
+
+        update = trade("Close " + side.split()[-1], "update-" + side)
+        lifecycle.enqueue(db, update, None, [webhook], now=110)
+        lifecycle.dispatch_db(db, 60, now=111)
+        assert patched[-1][2]["color"] == color
+
+        lifecycle.dispatch_db(db, 60, now=170)
+        finished = post_embeds[-1][1]
+        completed_original = patched[-1][2]
+        assert "ポジション変更完了" in finished["title"]
+        assert finished["color"] == color
+        assert "更新完了" in completed_original["title"]
+        assert completed_original["color"] == color
+        channel_id = "987654321" if webhook == "long-webhook" else "123456789"
+        expected = f"https://discord.com/channels/@me/{channel_id}/{original_id}"
+        assert f"[更新していた投稿]({expected})" in finished["description"]
+        assert "投稿元" not in completed_original["description"]
+
+
+def test_legacy_session_resolves_original_channel_before_final(tmp_path, monkeypatch):
+    """Older SQLite sessions without channel_id can still link their source."""
+    db = str(tmp_path / "trades_legacy.db")
+    posted = []
+    monkeypatch.setattr(lifecycle, "_persist_message", lambda *args: None)
+    monkeypatch.setattr(lifecycle, "_post", lambda _, embed: (
+        posted.append(embed) or "ok", str(len(posted)), 0, None
+    ))
+    monkeypatch.setattr(lifecycle, "_patch", lambda *_: ("ok", 0))
+    lifecycle.enqueue(db, trade(), None, ["https://discord.com/api/webhooks/11/token"], now=100)
+    lifecycle.dispatch_db(db, 60, now=101)
+    assert "投稿元" not in posted[0]["description"]
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE notification_sessions SET channel_id=NULL")
+    monkeypatch.setattr(lifecycle, "_recover_original_channel_id", lambda *_: "5555555")
+    lifecycle.dispatch_db(db, 60, now=160)
+    assert (
+        "[更新していた投稿](https://discord.com/channels/@me/5555555/1)"
+        in posted[-1]["description"]
+    )
+
+
+def test_post_response_carries_channel_id(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "12345", "channel_id": "98765"}
+
+    def post(url, json, timeout):
+        assert "wait=true" in url
+        assert timeout == 10
+        return Response()
+
+    monkeypatch.setattr(lifecycle.requests, "post", post)
+    assert lifecycle._post("https://discord.com/api/webhooks/1/token", {"title": "test"}) == (
+        "ok", "12345", 0, "98765"
+    )
+
+
+def test_short_color_for_initial_embed():
+    assert lifecycle._initial_embed(trade("Open Short"), None)["color"] == 0x0099FF
+    assert lifecycle._initial_embed(trade("Open Long"), None)["color"] == 0x00FF00
