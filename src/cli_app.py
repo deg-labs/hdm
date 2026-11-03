@@ -17,6 +17,7 @@ import sqlite3
 from pathlib import Path
 from contextlib import suppress
 from . import discord_retention as retention
+from . import notification_lifecycle as lifecycle
 from dotenv import load_dotenv
 from hyperliquid.info import Info
 
@@ -79,8 +80,6 @@ if DB_DIRECTORY != '.':
     os.makedirs(DB_DIRECTORY, exist_ok=True)
     logger.debug("database directory set path=%s", DB_DIRECTORY)
 
-last_notification_time = defaultdict(float)
-
 trade_cache = defaultdict(list)
 monitor_instances = {}
 main_loop = None
@@ -93,7 +92,6 @@ HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 HYPERLIQUID_REQUEST_TIMEOUT = 10
 
 processed_trades = set()
-startup_grace_period = {}
 
 
 def user_fill_inactivity_timed_out(last_user_fill_time, timeout_seconds, now=None):
@@ -208,7 +206,12 @@ def cleanup_old_discord_messages(db_path: str, force: bool = False) -> None:
         with sqlite3.connect(db_path) as conn:
             rows = conn.execute("""SELECT message_id, posted_at, webhook_url
                 FROM discord_messages ORDER BY posted_at DESC, rowid DESC""").fetchall()
-        stale = retention.stale_rows(rows, keep, max_age)
+        with sqlite3.connect(db_path) as conn:
+            active_ids = lifecycle.active_message_ids(conn)
+        stale = [
+            row for row in retention.stale_rows(rows, keep, max_age)
+            if row[0] not in active_ids
+        ]
         complete = recovered
         deleted = 0
         for message_id, posted_at, webhook_url in stale:
@@ -426,81 +429,38 @@ Ghost: https://app.hyperliquid.xyz/trade/{trade.coin}/{collateral_ticker}?hloa={
     }
 
 def process_trade_with_db(webhook_url: str, trade: Trade, db_path: str, tag: str, specific_webhook_url: str = None):
-    """DBパスを指定してトレードを処理"""
-    global trade_cache, processed_trades, startup_grace_period, last_notification_time
+    """Persist each distinct fill, then update its Discord notification session.
 
-    # 通知するDirectionを限定
+    A notification interval no longer drops fills: the initial event is POSTed,
+    subsequent fills PATCH the same message, and an idle sweep POSTs the tail.
+    """
     allowed_directions = {"Open Long", "Close Long", "Open Short", "Close Short"}
     if trade.direction not in allowed_directions:
         return
 
-    # ヘルスチェックファイルを更新
     touch_healthcheck_file()
-
-    address_suffix = trade.address[-8:]
     trade_key = make_trade_uid(trade)
-    
-    # メモリベースの重複チェック
     if trade_key in processed_trades:
-        logger.debug("trade skipped reason=memory_duplicate address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
         return
-    
-    # 通知を抑制する（起動時の大量通知を防ぐ）
-    current_time = time.time()
-    address_startup_time = startup_grace_period.get(trade.address)
-    
-    if address_startup_time and (current_time - address_startup_time) < 60:
-        logger.debug("trade skipped reason=startup_grace address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
-        processed_trades.add(trade_key)
-        record_trade_in_db(db_path, trade)
-        return
-    
+
     ensure_trades_table(db_path)
     if check_trade_exists_in_db(db_path, trade):
-        logger.debug("trade skipped reason=db_duplicate address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
         processed_trades.add(trade_key)
         return
 
-    # 通知抑制ロジック
-    suppression_key = (
-        trade.address,
-        trade.coin,
-        trade.direction,
-        trade.is_liquidation,
-        trade.liquidation_kind,
-    )
-    last_time = last_notification_time.get(suppression_key)
-
-    if last_time and (current_time - last_time) < NOTIFICATION_SUPPRESSION_SECONDS:
-        logger.info(
-            "notification suppressed address_suffix=%s coin=%s direction=%s last_notification=%s",
-            address_suffix,
-            trade.coin,
-            trade.direction,
-            datetime.fromtimestamp(last_time).strftime('%Y-%m-%d %H:%M:%S'),
-        )
-        processed_trades.add(trade_key)
-        record_trade_in_db(db_path, trade)
+    if not record_trade_in_db(db_path, trade):
+        logger.error("failed to persist fill before notification tx=%s", trade.tx_hash)
         return
-
-    # 新しいトレードとして処理
     processed_trades.add(trade_key)
-    record_trade_in_db(db_path, trade)
-    
-    embed = build_trade_embed(trade, tag)
-
-    logger.info("sending discord notification address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
-    msg_id = send_to_discord(webhook_url, embed=embed)
-    if msg_id:
-        record_discord_message(db_path, msg_id, webhook_url)
-
-    if specific_webhook_url:
-        logger.info("sending specific discord notification address_suffix=%s tx=%s", address_suffix, trade.tx_hash)
-        msg_id2 = send_to_discord(specific_webhook_url, embed=embed)
-        if msg_id2:
-            record_discord_message(db_path, msg_id2, specific_webhook_url)
-
-    last_notification_time[suppression_key] = current_time
+    lifecycle.enqueue(
+        db_path, trade, tag,
+        (webhook_url, specific_webhook_url),
+        build_trade_embed(trade, tag),
+    )
+    logger.debug(
+        "notification session updated address_suffix=%s coin=%s tx=%s",
+        trade.address[-8:], trade.coin, trade.tx_hash,
+    )
 
 
 def ensure_trades_table(db_path: str) -> None:
@@ -824,7 +784,7 @@ def remove_pidfile(pidfile):
 
 async def monitor_addresses_async(webhook_url: str, addresses: dict):
     """複数アドレスを単一 WebSocket 接続で監視し、切断時に自動再接続する"""
-    global startup_grace_period, monitor_instances
+    global monitor_instances
 
     address_state = {}
     for address, info in addresses.items():
@@ -867,7 +827,6 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
             for index, (address, info) in enumerate(addresses.items()):
                 tag = info.get('tag')
                 logger.info("preparing subscription index=%s address=%s tag=%s", index, address, tag or "")
-                startup_grace_period[address] = time.time()
 
             monitor = HyperliquidUserFillsMonitor(
                 addresses=list(addresses.keys()),
@@ -921,7 +880,7 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
             if error_container['error']:
                 raise error_container['error']
 
-            logger.info("shared monitor started addresses=%s startup_grace_seconds=60", len(addresses))
+            logger.info("shared monitor started addresses=%s", len(addresses))
             reconnect_attempts = 0
 
             while monitor_thread.is_alive() and not shutdown_requested.is_set():
@@ -978,6 +937,15 @@ async def monitor_addresses_async(webhook_url: str, addresses: dict):
                 )
                 await asyncio.sleep(wait_time)
 
+async def discord_notification_loop():
+    """Flush live PATCH updates and trailing POSTs independently of new fills."""
+    while not shutdown_requested.is_set():
+        await asyncio.to_thread(
+            lifecycle.dispatch_all, DB_DIRECTORY, NOTIFICATION_SUPPRESSION_SECONDS
+        )
+        await asyncio.sleep(2)
+
+
 async def run_multi_monitor_async(webhook_url: str, addresses: dict):
     """複数アドレスの非同期監視"""
     logger.info("starting multi-address monitor addresses=%s", len(addresses))
@@ -989,6 +957,7 @@ async def run_multi_monitor_async(webhook_url: str, addresses: dict):
         )
 
     retention_task = asyncio.create_task(discord_retention_loop())
+    notification_task = asyncio.create_task(discord_notification_loop())
     try:
         await monitor_addresses_async(webhook_url, addresses)
     except Exception as e:
@@ -996,8 +965,11 @@ async def run_multi_monitor_async(webhook_url: str, addresses: dict):
         raise
     finally:
         retention_task.cancel()
+        notification_task.cancel()
         with suppress(asyncio.CancelledError):
             await retention_task
+        with suppress(asyncio.CancelledError):
+            await notification_task
 
 def signal_handler(signum, frame):
     global monitor_instances, main_loop
